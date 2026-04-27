@@ -1,0 +1,35 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# App runtime files
+mdex_history.json
+mdex_checkpoint.json
+mdex_*.xlsx
+mdex_*.json
+mal_*.xml
+mal_*.xml.gz
+anilist_*.xml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

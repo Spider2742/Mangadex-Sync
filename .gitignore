@@ -10,3 +10,7 @@ venv/
 # Runtime data written by the app next to wherever it's launched from
 mdex_history.json
 mdex_checkpoint.json
+
+# Local secrets (PyPI token etc.)
+.env
+.env.*

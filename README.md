@@ -66,7 +66,10 @@ Opens at `http://localhost:7337` — also accessible from any browser on your ne
 | **Resume** | Picks up from checkpoint if interrupted |
 | **Dry run** | Preview what would happen without making changes |
 | **Scores** | Carries your MangaDex ratings across to MAL/AniList |
-| **History** | Logs every export with timestamp and file list |
+| **History** | Every export, import and convert run with totals, timing, match rate and search |
+| **Live counts** | Per-status title counts pulled from your library before you export |
+| **Credential check** | Verifies your MangaDex login and shows token validity |
+| **Keyboard shortcuts** | `1`-`5` switch pages, `Ctrl+Enter` starts a run, `Esc` stops it |
 | **Native window** | Desktop app via pywebview, falls back to browser |
 
 ---
@@ -93,7 +96,7 @@ Opens at `http://localhost:7337` — also accessible from any browser on your ne
 1. Go to the **Export** tab
 2. Enter your credentials and choose a save folder
 3. Pick **Fast** or **Deep** mode
-4. Click **⚡ Extract Entire Library**
+4. Click **Extract entire library** (or press `Ctrl+Enter`)
 
 | Mode | Speed | Includes chapter progress |
 |---|---|---|
@@ -109,7 +112,7 @@ Use the **Import** tab to restore your library from:
 - `mal_*.xml` — a MAL export file
 - `anilist_*.xml` — an AniList export file
 
-Browse to your file, optionally enable **Import Scores**, and click **Start Import**.
+Browse to your file, optionally enable **Import ratings**, and click **Start import**.
 
 ---
 

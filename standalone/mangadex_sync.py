@@ -16,6 +16,7 @@ import pandas as pd
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 # ── Config ─────────────────────────────────────────────────────────────────────
+APP_VERSION = "2.2.0"
 PORT      = 7337
 API_BASE  = "https://api.mangadex.org"
 AUTH_URL  = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token"
@@ -776,6 +777,57 @@ def export():
     threading.Thread(target=_run_export, args=(params,), daemon=True).start()
     return jsonify(ok=True)
 
+@app.route("/api/test_credentials", methods=["POST"])
+def test_credentials():
+    """Real credential verification (backs the 'Verified' badge on the
+    Credentials card). Returns how many seconds the resulting token is
+    actually good for, straight from API._store()'s real expires_at."""
+    p = request.json or {}
+    if not all(p.get(k) for k in ("client_id", "client_secret", "username", "password")):
+        return jsonify(ok=False, error="Missing credentials"), 400
+    api = API()
+    if not api.auth(p["client_id"], p["client_secret"], p["username"], p["password"]):
+        return jsonify(ok=False, error="Authentication failed"), 401
+    expires_in = int((api.expires_at - datetime.now()).total_seconds())
+    return jsonify(ok=True, expires_in=max(0, expires_in))
+
+# External links the UI may ask the OS to open (pywebview can't follow target=_blank itself).
+_OPEN_URL_PREFIXES = ("https://myanimelist.net/", "https://mangadex.org/", "https://anilist.co/")
+
+@app.route("/api/open_url", methods=["POST"])
+def open_url():
+    url = (request.json or {}).get("url", "")
+    if not url.startswith(_OPEN_URL_PREFIXES):
+        return jsonify(ok=False, error="URL not allowed"), 400
+    webbrowser.open(url)
+    return jsonify(ok=True)
+
+@app.route("/api/info")
+def info():
+    import platform
+    return jsonify(version=APP_VERSION, cwd=os.getcwd(),
+                   history_file=os.path.abspath(_history_file),
+                   checkpoint_file=os.path.abspath(_checkpoint_file),
+                   platform=f"{platform.system()} {platform.release()}",
+                   python=platform.python_version())
+
+@app.route("/api/library_counts", methods=["POST"])
+def library_counts():
+    """Real per-status title counts for the export status chips. A quick
+    auth + single /manga/status call, independent of the export worker so
+    it can't collide with a run in progress."""
+    if _state["running"]:
+        return jsonify(ok=False, error="Export already running"), 400
+    p = request.json or {}
+    if not all(p.get(k) for k in ("client_id", "client_secret", "username", "password")):
+        return jsonify(ok=False, error="Missing credentials"), 400
+    api = API()
+    if not api.auth(p["client_id"], p["client_secret"], p["username"], p["password"]):
+        return jsonify(ok=False, error="Authentication failed"), 401
+    all_st = api.statuses()
+    counts = {s: len(all_st.get(s, [])) for s in STATUSES}
+    return jsonify(ok=True, counts=counts, total=sum(counts.values()))
+
 @app.route("/api/resume", methods=["POST"])
 def resume():
     if _state["running"]:
@@ -954,14 +1006,70 @@ except Exception:
 root.destroy()
 """
 
+def _native_linux_dialog(args, timeout=120):
+    """Run a native Linux dialog command (zenity/kdialog) and return its
+    stdout path, or None if the tool isn't available / failed to launch
+    (as opposed to the user simply cancelling, which is a clean "" result).
+    """
+    import subprocess
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return None
+    # returncode 0 = a path was chosen, 1 = the user cancelled (both are a
+    # real answer from a dialog that did launch); anything else means the
+    # tool itself errored out, so fall back instead of trusting its output.
+    if result.returncode in (0, 1):
+        return result.stdout.strip()
+    return None
+
+def _pick_folder():
+    """Native folder picker matching the desktop's own file manager.
+    Tk's picker isn't native-themed on Linux (unlike Windows/macOS, where
+    tkinter already calls the OS's own dialog), so prefer zenity (GTK/
+    GNOME/Nautilus look) or kdialog (KDE/Dolphin look) there, falling back
+    to Tk only if neither is installed."""
+    import platform, shutil
+    if platform.system() == "Linux":
+        if shutil.which("zenity"):
+            path = _native_linux_dialog(
+                ["zenity", "--file-selection", "--directory", "--title=Choose save folder"])
+            if path is not None:
+                return path
+        elif shutil.which("kdialog"):
+            path = _native_linux_dialog(
+                ["kdialog", "--getexistingdirectory", os.getcwd(), "--title", "Choose save folder"])
+            if path is not None:
+                return path
+    return _run_tk_subprocess(_TK_BROWSE_FOLDER)
+
+def _pick_file():
+    """Native file picker; see _pick_folder() for why Linux needs zenity/kdialog."""
+    import platform, shutil
+    if platform.system() == "Linux":
+        if shutil.which("zenity"):
+            path = _native_linux_dialog(
+                ["zenity", "--file-selection", "--title=Select import file",
+                 "--file-filter=XML / JSON files | *.xml *.json",
+                 "--file-filter=All files | *"])
+            if path is not None:
+                return path
+        elif shutil.which("kdialog"):
+            path = _native_linux_dialog(
+                ["kdialog", "--getopenfilename", os.getcwd(),
+                 "*.xml *.json|XML / JSON files", "--title", "Select import file"])
+            if path is not None:
+                return path
+    return _run_tk_subprocess(_TK_BROWSE_FILE)
+
 @app.route("/api/browse_folder")
 def browse_folder():
-    path = _run_tk_subprocess(_TK_BROWSE_FOLDER)
+    path = _pick_folder()
     return jsonify(ok=bool(path), path=path)
 
 @app.route("/api/browse_file")
 def browse_file():
-    path = _run_tk_subprocess(_TK_BROWSE_FILE)
+    path = _pick_file()
     return jsonify(ok=bool(path), path=path)
 
 @app.route("/api/clipboard")
@@ -975,1118 +1083,1532 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MangaDex Exporter</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<title>MangaDex Sync</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg:      #0c0e14;
-  --surface: #13161f;
-  --card:    #181c28;
-  --border:  #252840;
-  --accent:  #f0a500;
-  --accent2: #7c6af7;
-  --green:   #3ecf8e;
-  --red:     #f06060;
-  --yellow:  #f0c060;
-  --text:    #e8eaf6;
-  --muted:   #6b7280;
-  --mono:    'Space Mono', monospace;
-  --sans:    'DM Sans', sans-serif;
-  --radius:  10px;
+  --bg: #0b0d12;  --panel: #12151c;  --card: #161a23;  --card-2: #1c212c;  --field: #0e1117;
+  --border: #252a36;  --border-2: #323949;  --divider: #1f2430;
+  --text: #eef0f6;  --text-2: #bcc2d0;  --muted: #8b93a7;  --faint: #5b6272;
+  --accent: #e8823c;  --accent-2: #f2954f;  --accent-ink: #1a0f06;
+  --accent-tint: rgba(232,130,60,.10);  --accent-line: rgba(232,130,60,.38);
+  --ok: #3ecf8e;  --ok-tint: rgba(62,207,142,.10);  --ok-line: rgba(62,207,142,.35);
+  --warn: #e0b23e;  --warn-tint: rgba(224,178,62,.10);  --warn-line: rgba(224,178,62,.35);
+  --err: #ef5350;  --err-tint: rgba(239,83,80,.10);  --err-line: rgba(239,83,80,.35);
+  --info: #5fa8e8; --info-tint: rgba(95,168,232,.10); --info-line: rgba(95,168,232,.32);
+
+  --c-reading: #5fa8e8;      --t-reading: rgba(95,168,232,.12);
+  --c-completed: #3ecfc2;    --t-completed: rgba(62,207,194,.12);
+  --c-on_hold: #dc9a45;      --t-on_hold: rgba(220,154,69,.12);
+  --c-dropped: #e8768a;      --t-dropped: rgba(232,118,138,.12);
+  --c-plan_to_read: #9a94f0; --t-plan_to_read: rgba(154,148,240,.12);
+  --c-re_reading: #c98adb;   --t-re_reading: rgba(201,138,219,.12);
+
+  --sans: 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'Space Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  --r-xs: 4px; --r-sm: 6px; --r-md: 8px;
+  --ctl: 32px;
+  --ring: 0 0 0 1px var(--bg), 0 0 0 3px var(--accent-line);
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: var(--sans);
-       font-size: 14px; display: flex; height: 100vh; overflow: hidden; }
+[hidden] { display: none !important; }
+html { color-scheme: dark; }
+body { background: var(--bg); color: var(--text); font: 13px/1.5 var(--sans); display: flex;
+       height: 100vh; overflow: hidden; -webkit-font-smoothing: antialiased; }
+::selection { background: var(--accent); color: var(--accent-ink); }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; background: none; border: 0; }
+:focus { outline: none; }
+:focus-visible { box-shadow: var(--ring); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+.i { width: 1em; height: 1em; stroke: currentColor; stroke-width: 1.75; fill: none; stroke-linecap: round;
+     stroke-linejoin: round; flex-shrink: 0; }
+.i .dot { fill: currentColor; stroke: none; }
 
 /* ── Sidebar ── */
-.sidebar { width: 220px; background: var(--surface); border-right: 1px solid var(--border);
-            display: flex; flex-direction: column; padding: 20px 0; flex-shrink: 0; }
-.logo { padding: 0 20px 24px; border-bottom: 1px solid var(--border); }
-.logo h1 { font-family: var(--mono); font-size: 13px; color: var(--accent);
-            letter-spacing: 0.05em; line-height: 1.5; }
-.logo small { color: var(--muted); font-size: 11px; }
-nav { padding: 16px 8px; flex: 1; }
-.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-             border-radius: var(--radius); cursor: pointer; color: var(--muted);
-             font-weight: 500; font-size: 13px; transition: all .15s; margin-bottom: 2px;
-             border: 1px solid transparent; user-select: none; }
-.nav-item:hover  { background: var(--card); color: var(--text); }
-.nav-item.active { background: var(--card); color: var(--accent);
-                   border-color: var(--border); }
-.nav-icon { font-size: 16px; width: 20px; text-align: center; }
-.sidebar-footer { padding: 16px 20px; border-top: 1px solid var(--border); }
-.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green);
-               display: inline-block; margin-right: 6px; }
-.status-dot.busy { background: var(--accent); animation: pulse 1s infinite; }
-.status-dot.idle { background: var(--muted); }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+.sidebar { width: 232px; flex-shrink: 0; background: var(--panel); border-right: 1px solid var(--border);
+           display: flex; flex-direction: column; }
+.brand { display: flex; align-items: center; gap: 10px; height: 56px; padding: 0 16px; border-bottom: 1px solid var(--divider); }
+.brand-mark { width: 28px; height: 28px; border-radius: var(--r-sm); display: grid; place-items: center;
+              background: linear-gradient(150deg, var(--accent-2), var(--accent)); color: var(--accent-ink);
+              font-size: 15px; box-shadow: 0 4px 14px -6px rgba(232,130,60,.8), inset 0 1px 0 rgba(255,255,255,.25); }
+.brand-name { font-family: var(--mono); font-size: 13px; font-weight: 700; letter-spacing: .01em; line-height: 1.2; }
+.brand-name b { color: var(--accent); font-size: 10px; letter-spacing: .12em; margin-left: 4px; }
+.brand-ver { display: block; font-family: var(--mono); font-size: 10px; color: var(--faint); }
+.nav-label { font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .12em;
+             text-transform: uppercase; color: var(--faint); padding: 18px 16px 8px; }
+nav { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
+.nav-item { position: relative; display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px;
+            border-radius: var(--r-sm); color: var(--muted); font-size: 13px; font-weight: 500; text-align: left;
+            transition: background-color .15s, color .15s; }
+.nav-item .i { font-size: 16px; }
+.nav-item kbd { margin-left: auto; }
+.nav-item:hover { background: var(--card); color: var(--text); }
+.nav-item.active { background: var(--card); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+.nav-item.active .i { color: var(--accent); }
+.nav-item.active::before { content: ""; position: absolute; left: -8px; top: 9px; bottom: 9px; width: 3px;
+                           border-radius: 0 3px 3px 0; background: var(--accent); }
+.side-foot { margin-top: auto; border-top: 1px solid var(--divider); padding: 12px 16px 14px; display: grid; gap: 7px; }
+.kv { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-family: var(--mono); font-size: 10.5px; }
+.kv > span:first-child { color: var(--faint); letter-spacing: .08em; text-transform: uppercase; }
+.kv > span:last-child { color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+                         overflow: hidden; text-overflow: ellipsis; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex-shrink: 0; display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.accent { background: var(--accent); } .dot.warn { background: var(--warn); }
+.dot.live { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
 
 /* ── Main ── */
-.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.topbar { height: 52px; background: var(--surface); border-bottom: 1px solid var(--border);
-           display: flex; align-items: center; padding: 0 24px; gap: 12px; flex-shrink: 0; }
-.topbar h2 { font-family: var(--mono); font-size: 12px; color: var(--accent);
-              letter-spacing: .12em; text-transform: uppercase; }
-.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
-.badge { background: var(--card); border: 1px solid var(--border); border-radius: 6px;
-          padding: 3px 10px; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar { height: 56px; flex-shrink: 0; background: var(--panel); border-bottom: 1px solid var(--border);
+          display: flex; align-items: center; gap: 12px; padding: 0 20px; }
+.crumbs { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+          display: flex; align-items: center; gap: 8px; color: var(--faint); }
+.crumbs .sep { color: var(--border-2); }
+.crumbs #pageTitle { color: var(--text); }
+.top-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.run-meter { display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 10px; border: 1px solid var(--border);
+             border-radius: var(--r-sm); background: var(--field); font-family: var(--mono); font-size: 11px; }
+.run-meter .pct { color: var(--accent); font-weight: 700; min-width: 4ch; }
+.run-meter .mini { width: 96px; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+.run-meter .mini > i { display: block; height: 100%; width: 100%; background: var(--accent); transform: scaleX(0);
+                       transform-origin: left; transition: transform .4s ease; }
+.run-meter .eta { color: var(--muted); }
 
-.content { flex: 1; overflow-y: auto; padding: 20px 24px; }
-.page { display: none; }
+.content { flex: 1; overflow-y: auto; padding: 20px 24px 28px; }
+.page { display: none; max-width: 1360px; margin: 0 auto; }
 .page.active { display: block; }
+.page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.page-head h1 { font-family: var(--mono); font-size: 20px; font-weight: 700; letter-spacing: -.01em; line-height: 1.2; }
+.page-head p { color: var(--muted); font-size: 13px; margin-top: 4px; max-width: 70ch; }
+.head-meta { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 
-/* ── Cards ── */
-.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-         padding: 18px; margin-bottom: 16px; }
-.card-title { font-family: var(--mono); font-size: 11px; color: var(--accent);
-               letter-spacing: .1em; text-transform: uppercase; margin-bottom: 14px;
-               display: flex; align-items: center; gap: 8px; }
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-@media(max-width:900px){ .two-col,.three-col{ grid-template-columns:1fr; } }
+.grid-2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 14px; align-items: start; }
+.col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+@media (max-width: 1120px) { .grid-2 { grid-template-columns: minmax(0,1fr); } }
 
-/* ── Form ── */
-.field { margin-bottom: 12px; }
-.field label { display: block; font-size: 11px; color: var(--muted);
-                text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
-.input-row { display: flex; gap: 8px; }
-input[type=text], input[type=password] {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-  color: var(--text); padding: 9px 12px; font-size: 13px; width: 100%;
-  font-family: var(--sans); outline: none; transition: border-color .15s; }
-input[type=text]:focus, input[type=password]:focus { border-color: var(--accent); }
-input[type=text]::placeholder, input[type=password]::placeholder { color: var(--muted); }
+/* ── Card ── */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r-md); min-width: 0; }
+.card-hd { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px;
+           padding: 0 14px; border-bottom: 1px solid var(--divider); }
+.card-t { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11.5px; font-weight: 700;
+          letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+.card-t .step { color: var(--accent); }
+.card-t .i { color: var(--accent); font-size: 14px; }
+.card-tools { display: flex; align-items: center; gap: 6px; }
+.card-bd { padding: 14px; }
+.card-bd.flush { padding: 0; }
+
+/* ── Pills ── */
+.pill { display: inline-flex; align-items: center; gap: 6px; height: 20px; padding: 0 7px; border-radius: var(--r-xs);
+        border: 1px solid var(--border-2); color: var(--muted); font-family: var(--mono); font-size: 10px; font-weight: 700;
+        letter-spacing: .07em; text-transform: uppercase; white-space: nowrap; }
+.pill.ok { color: var(--ok); border-color: var(--ok-line); background: var(--ok-tint); }
+.pill.warn { color: var(--warn); border-color: var(--warn-line); background: var(--warn-tint); }
+.pill.err { color: var(--err); border-color: var(--err-line); background: var(--err-tint); }
+.pill.accent { color: var(--accent); border-color: var(--accent-line); background: var(--accent-tint); }
+.pill.info { color: var(--info); border-color: var(--info-line); background: var(--info-tint); }
+.pill .val { color: var(--text); }
+.sub-note { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+
+/* ── Fields ── */
+.field + .field, .row-2 + .field, .field + .row-2 { margin-top: 12px; }
+.row-2 { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px; }
+.lbl { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.lbl label, .lbl .l { font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .08em;
+                      text-transform: uppercase; color: var(--muted); }
+.lbl .h { font-size: 11px; color: var(--faint); text-align: right; }
+.control { display: flex; align-items: stretch; height: var(--ctl); background: var(--field); border: 1px solid var(--border);
+           border-radius: var(--r-sm); overflow: hidden; transition: border-color .15s, box-shadow .15s; }
+.control:hover { border-color: var(--border-2); }
+.control:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); }
+.control .pre { display: grid; place-items: center; padding-left: 10px; color: var(--accent); font-family: var(--mono);
+                font-size: 12px; font-weight: 700; }
+.control .pre .i { color: var(--faint); font-size: 14px; }
+.control input { flex: 1; min-width: 0; background: transparent; border: 0; outline: none; padding: 0 10px; font-size: 13px; }
+.control input.mono { font-family: var(--mono); font-size: 12px; }
+.control input::placeholder { color: var(--faint); }
+.control input:focus-visible { box-shadow: none; }
+.ctl-btn { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; border-left: 1px solid var(--divider);
+           color: var(--muted); font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .07em;
+           text-transform: uppercase; transition: color .15s, background-color .15s; }
+.ctl-btn:hover { color: var(--text); background: var(--card-2); }
+.ctl-btn .i { font-size: 13px; }
+.ctl-btn.icon { padding: 0 9px; }
+.ctl-btn:focus-visible { box-shadow: inset 0 0 0 2px var(--accent-line); }
 
 /* ── Buttons ── */
-.btn { padding: 9px 18px; border-radius: 8px; font-size: 13px; font-weight: 500;
-        cursor: pointer; border: 1px solid var(--border); background: var(--surface);
-        color: var(--text); font-family: var(--sans); transition: all .15s;
-        display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-.btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.btn:disabled { opacity: .4; cursor: not-allowed; }
-.btn-primary { background: var(--accent); color: #000; border-color: var(--accent);
-                font-weight: 600; }
-.btn-primary:hover:not(:disabled) { background: #ffc107; border-color: #ffc107; color:#000; }
-.btn-success { background: var(--green); color: #000; border-color: var(--green); font-weight:600; }
-.btn-success:hover:not(:disabled) { background: #5de0a6; }
-.btn-danger { background: #3b1515; border-color: var(--red); color: var(--red); }
-.btn-danger:hover:not(:disabled) { background: var(--red); color: #000; }
-.btn-sm { padding: 5px 12px; font-size: 12px; }
-.btn-xs { padding: 3px 8px; font-size: 11px; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: var(--ctl); padding: 0 12px;
+       border-radius: var(--r-sm); border: 1px solid var(--border-2); color: var(--text); font-family: var(--mono);
+       font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; white-space: nowrap;
+       transition: background-color .15s, border-color .15s, color .15s, transform .08s; }
+.btn .i { font-size: 14px; }
+.btn:hover:not(:disabled) { background: var(--card-2); border-color: #3e4559; }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: .38; cursor: not-allowed; }
+.btn-sm { height: 26px; padding: 0 9px; font-size: 10.5px; }
+.btn-sm .i { font-size: 12px; }
+.btn-ghost { border-color: transparent; color: var(--muted); }
+.btn-ghost:hover:not(:disabled) { color: var(--text); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
+               box-shadow: inset 0 1px 0 rgba(255,255,255,.22), 0 6px 18px -8px rgba(232,130,60,.7); }
+.btn-primary:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); }
+.btn-lg { height: 42px; font-size: 12px; padding: 0 16px; }
+.btn-lg .i { font-size: 16px; }
+.btn-danger { background: var(--err-tint); border-color: var(--err-line); color: var(--err); }
+.btn-danger:hover:not(:disabled) { background: rgba(239,83,80,.2); border-color: var(--err); }
+.btn-ok { background: var(--ok); border-color: var(--ok); color: #05261a;
+          box-shadow: inset 0 1px 0 rgba(255,255,255,.22), 0 6px 18px -8px rgba(62,207,142,.6); }
+.btn-ok:hover:not(:disabled) { filter: brightness(1.08); }
+.btn .count { opacity: .7; font-weight: 400; }
+.action-row { display: flex; gap: 8px; }
+.action-row .grow { flex: 1; }
 
-/* ── Mode selector ── */
-.mode-group { display: flex; gap: 8px; }
-.mode-btn { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
-             background: var(--surface); color: var(--muted); cursor: pointer;
-             text-align: center; font-size: 12px; font-family: var(--mono);
-             transition: all .15s; user-select: none; }
-.mode-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(240,165,0,.08); }
-.mode-btn .mode-label { font-size: 13px; font-weight: 700; display: block; }
-.mode-btn .mode-desc  { font-size: 10px; color: inherit; opacity: .7; display: block; margin-top: 2px; }
+/* ── Segmented ── */
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; background: var(--field);
+       border: 1px solid var(--border); border-radius: var(--r-sm); }
+.seg-opt { text-align: left; padding: 8px 10px; border-radius: var(--r-xs); transition: background-color .15s; }
+.seg-opt:hover { background: var(--card); }
+.seg-opt .t { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 11.5px; font-weight: 700;
+              letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.seg-opt .t .i { font-size: 13px; }
+.seg-opt .s { display: block; margin-top: 3px; font-size: 12px; color: var(--faint); line-height: 1.4; }
+.seg-opt.active { background: var(--accent-tint); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.seg-opt.active .t { color: var(--accent); }
+.seg-opt.active .s { color: var(--text-2); }
 
-/* ── Checkboxes ── */
-.checks { display: flex; flex-wrap: wrap; gap: 8px; }
-.check-item { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
-               border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
-               font-size: 12px; user-select: none; transition: all .15s; }
-.check-item:hover { border-color: var(--accent2); }
-.check-item input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
+.tabs { display: inline-flex; gap: 2px; padding: 2px; background: var(--field); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.tab { height: 26px; padding: 0 10px; border-radius: var(--r-xs); font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+       letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+.tab:hover { color: var(--text); }
+.tab.active { background: var(--card-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-2); }
+.tab .n { color: var(--faint); margin-left: 4px; }
 
-/* ── Status chips ── */
-.status-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chip { padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
-         cursor: pointer; border: 1px solid; transition: all .15s; user-select: none; }
-.chip[data-status="reading"]      { border-color:#3b82f6; color:#3b82f6; background:rgba(59,130,246,.08); }
-.chip[data-status="completed"]    { border-color:#8b5cf6; color:#8b5cf6; background:rgba(139,92,246,.08); }
-.chip[data-status="on_hold"]      { border-color:#f59e0b; color:#f59e0b; background:rgba(245,158,11,.08); }
-.chip[data-status="dropped"]      { border-color:#ef4444; color:#ef4444; background:rgba(239,68,68,.08); }
-.chip[data-status="plan_to_read"] { border-color:#22d3ee; color:#22d3ee; background:rgba(34,211,238,.08); }
-.chip[data-status="re_reading"]   { border-color:#ec4899; color:#ec4899; background:rgba(236,72,153,.08); }
-.chip:hover { opacity: .8; transform: translateY(-1px); }
+/* ── Option tiles (checkbox) ── */
+.opts { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 8px; }
+.opts.one { grid-template-columns: minmax(0,1fr); }
+.opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px; background: var(--field); border: 1px solid var(--border);
+       border-radius: var(--r-sm); cursor: pointer; transition: border-color .15s, background-color .15s; }
+.opt:hover { border-color: var(--border-2); }
+.opt:has(input:checked) { border-color: var(--accent-line); background: rgba(232,130,60,.05); }
+.opt input { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; margin-top: 1px; flex-shrink: 0;
+             border: 1px solid var(--border-2); border-radius: var(--r-xs); background: var(--panel); cursor: pointer;
+             transition: background-color .15s, border-color .15s; }
+.opt input:checked { background: var(--accent) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3.5 8.5l3 3 6-7' fill='none' stroke='%231a0f06' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/></svg>") center/12px no-repeat;
+                     border-color: var(--accent); }
+.opt input:focus-visible { box-shadow: var(--ring); }
+.opt .ot { display: block; font-size: 13px; font-weight: 600; color: var(--text); line-height: 1.3; }
+.opt .os { display: block; font-size: 12px; color: var(--faint); margin-top: 2px; line-height: 1.35; }
+
+/* ── Status tiles ── */
+.st-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
+.st { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 36px; padding: 0 10px;
+      border-radius: var(--r-xs); border: 1px solid; font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+      letter-spacing: .06em; text-transform: uppercase; transition: filter .15s, transform .08s; }
+.st:hover:not(:disabled) { filter: brightness(1.2); }
+.st:active:not(:disabled) { transform: translateY(1px); }
+.st:disabled { opacity: .4; cursor: not-allowed; }
+.st .cnt { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--text); }
+.st .go { font-size: 13px; opacity: .6; }
+.st[data-status="reading"]      { color: var(--c-reading);      border-color: rgba(95,168,232,.45);  background: var(--t-reading); }
+.st[data-status="completed"]    { color: var(--c-completed);    border-color: rgba(62,207,194,.45);  background: var(--t-completed); }
+.st[data-status="on_hold"]      { color: var(--c-on_hold);      border-color: rgba(220,154,69,.45);  background: var(--t-on_hold); }
+.st[data-status="dropped"]      { color: var(--c-dropped);      border-color: rgba(232,118,138,.45); background: var(--t-dropped); }
+.st[data-status="plan_to_read"] { color: var(--c-plan_to_read); border-color: rgba(154,148,240,.45); background: var(--t-plan_to_read); }
+.st[data-status="re_reading"]   { color: var(--c-re_reading);   border-color: rgba(201,138,219,.45); background: var(--t-re_reading); }
+.sect-lbl { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px;
+            font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.sect-lbl .h { font-weight: 400; color: var(--faint); letter-spacing: .04em; }
+.divider { height: 1px; background: var(--divider); margin: 14px -14px; }
 
 /* ── Progress ── */
-.progress-wrap { margin-bottom: 8px; }
-.progress-bar-bg { background: var(--surface); border-radius: 4px; height: 6px;
-                    overflow: hidden; border: 1px solid var(--border); }
-.progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #ffc107);
-                      border-radius: 4px; transition: width .4s ease; width: 0%; }
-.progress-meta { display: flex; justify-content: space-between; margin-top: 6px;
-                  font-size: 11px; font-family: var(--mono); color: var(--muted); }
+.prog-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.prog-pct { font-family: var(--mono); font-size: 30px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.prog-pct small { font-size: 14px; color: var(--muted); margin-left: 2px; }
+.prog-pct.idle { color: var(--faint); }
+.prog-label { font-size: 12.5px; color: var(--text-2); text-align: right; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.track { position: relative; height: 8px; border-radius: var(--r-xs); background: var(--field); border: 1px solid var(--border); overflow: hidden; }
+.track::after { content: ""; position: absolute; inset: 0; pointer-events: none;
+                background: repeating-linear-gradient(90deg, transparent 0 calc(5% - 1px), rgba(11,13,18,.9) calc(5% - 1px) 5%); }
+.track .fill { height: 100%; width: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2));
+               transform: scaleX(0); transform-origin: left; transition: transform .45s ease; }
+.prog-meta { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--divider); }
+.prog-meta div { min-width: 0; }
+.prog-meta .k { display: block; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.prog-meta .v { display: block; font-family: var(--mono); font-size: 12px; color: var(--text-2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ── Log ── */
-.log-box { background: #080a10; border: 1px solid var(--border); border-radius: var(--radius);
-            font-family: var(--mono); font-size: 12px; padding: 14px; height: 280px;
-            overflow-y: auto; line-height: 1.7; }
-.log-box::-webkit-scrollbar { width: 5px; }
-.log-box::-webkit-scrollbar-track { background: transparent; }
-.log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-.log-line { display: block; }
-.log-ts { color: var(--muted); margin-right: 8px; }
-.log-info    { color: var(--text); }
-.log-success { color: var(--green); }
-.log-error   { color: var(--red); }
-.log-warning { color: var(--yellow); }
+.log-wrap { position: relative; }
+.log-box { height: 300px; overflow-y: auto; background: #08090d; font-family: var(--mono); font-size: 11.5px; line-height: 1.8;
+           padding: 10px 14px; border-radius: 0 0 var(--r-md) var(--r-md); }
+.log-line { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-word; }
+.log-line .ts { color: var(--faint); flex-shrink: 0; }
+.log-line .tg { font-weight: 700; flex-shrink: 0; min-width: 6ch; }
+.log-line .m { color: var(--text-2); }
+.log-line.info .tg { color: var(--info); }
+.log-line.success .tg, .log-line.success .m { color: var(--ok); }
+.log-line.warning .tg, .log-line.warning .m { color: var(--warn); }
+.log-line.error .tg, .log-line.error .m { color: var(--err); }
+.log-sect { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; color: var(--accent); font-weight: 700;
+            letter-spacing: .08em; text-transform: uppercase; font-size: 10.5px; }
+.log-sect::before, .log-sect::after { content: ""; height: 1px; background: var(--divider); flex: 1; }
+.log-sect::before { flex: 0 0 12px; }
+.log-empty { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 6px; text-align: center; pointer-events: none; }
+.log-empty .i { font-size: 22px; color: var(--faint); margin-bottom: 4px; }
+.log-empty .t { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.log-empty .s { font-size: 12px; color: var(--faint); max-width: 34ch; }
+.log-empty .caret { display: inline-block; width: 7px; height: 13px; background: var(--accent); vertical-align: -2px; margin-left: 4px; animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0 } }
+.toggle-pill { cursor: pointer; }
+.toggle-pill:hover { border-color: var(--muted); }
 
-/* ── Table ── */
-.table-wrap { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { background: var(--surface); padding: 10px 14px; text-align: left;
-      font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
-      color: var(--muted); border-bottom: 1px solid var(--border); font-family: var(--mono); }
-td { padding: 9px 14px; border-bottom: 1px solid rgba(37,40,64,.5); }
-tr:last-child td { border-bottom: none; }
-tr:hover td { background: rgba(37,40,64,.5); }
+/* ── Rows / lists ── */
+.row-list { max-height: 260px; overflow-y: auto; }
+.row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--divider); min-height: 40px; }
+.row:last-child { border-bottom: 0; }
+.row:hover { background: var(--card-2); }
+.row .idx { font-family: var(--mono); font-size: 10.5px; color: var(--faint); min-width: 3ch; }
+.row .ttl { flex: 1; min-width: 0; font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .ttl.mono { font-family: var(--mono); font-size: 12px; }
+.row .i.lead { color: var(--muted); font-size: 15px; }
+.row select { height: 26px; background: var(--field); border: 1px solid var(--border); border-radius: var(--r-xs);
+              font-family: var(--mono); font-size: 11px; padding: 0 6px; cursor: pointer; }
+.row .acts { display: flex; gap: 2px; opacity: .75; }
+.row:hover .acts { opacity: 1; }
 
-/* ── File list ── */
-.file-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-              background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-              margin-bottom: 6px; }
-.file-item .file-name { flex: 1; font-family: var(--mono); font-size: 12px;
-                          word-break: break-all; }
-.file-status-select { background: var(--bg); border: 1px solid var(--border);
-                        color: var(--text); border-radius: 6px; padding: 4px 8px;
-                        font-size: 12px; cursor: pointer; }
+.empty { display: grid; justify-items: center; gap: 6px; padding: 30px 16px; text-align: center; }
+.empty > .i { font-size: 22px; color: var(--faint); margin-bottom: 4px; }
+.empty .t { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.empty .s { font-size: 12.5px; color: var(--faint); max-width: 42ch; }
+.empty .action-row { margin-top: 8px; }
+
+/* ── Callout ── */
+.callout { display: flex; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--field); }
+.callout .i { font-size: 15px; margin-top: 1px; }
+.callout .ct { display: block; font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.callout .cs { display: block; font-size: 12.5px; color: var(--text-2); margin-top: 2px; }
+.callout.warn { border-color: var(--warn-line); background: var(--warn-tint); } .callout.warn .i, .callout.warn .ct { color: var(--warn); }
+.callout.ok { border-color: var(--ok-line); background: var(--ok-tint); } .callout.ok .i, .callout.ok .ct { color: var(--ok); }
+.callout.info { border-color: var(--info-line); background: var(--info-tint); } .callout.info .i, .callout.info .ct { color: var(--info); }
+.callout.err { border-color: var(--err-line); background: var(--err-tint); } .callout.err .i, .callout.err .ct { color: var(--err); }
+
+/* ── kbd / hints ── */
+kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; font-family: var(--mono);
+      font-size: 10px; color: var(--muted); background: var(--field); border: 1px solid var(--border-2); border-bottom-width: 2px;
+      border-radius: var(--r-xs); line-height: 1; }
+.hints { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; font-family: var(--mono); font-size: 10.5px;
+         letter-spacing: .05em; text-transform: uppercase; color: var(--faint); }
+.hints span { display: inline-flex; align-items: center; gap: 5px; }
+
+/* ── Stats / table ── */
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }
+@media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+.stat { background: var(--card); border: 1px solid var(--border); border-radius: var(--r-md); padding: 12px 14px; }
+.stat-hd { display: flex; justify-content: space-between; align-items: center; font-family: var(--mono); font-size: 10px; font-weight: 700;
+           letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.stat-hd .i { color: var(--faint); font-size: 14px; }
+.stat-v { margin-top: 10px; font-family: var(--mono); font-size: 26px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.stat-v small { font-family: var(--sans); font-size: 12px; font-weight: 500; color: var(--muted); margin-left: 1px; }
+.stat-s { margin-top: 8px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+.stat.ok .stat-v { color: var(--ok); }
+.filterbar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--divider); flex-wrap: wrap; }
+.filterbar .control { flex: 1; min-width: 220px; }
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th { height: 34px; padding: 0 14px; text-align: left; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .09em;
+     text-transform: uppercase; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--divider); white-space: nowrap; }
+td { height: 40px; padding: 0 14px; border-bottom: 1px solid var(--divider); color: var(--text-2); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: var(--card-2); }
+th.r, td.r { text-align: right; }
+td.num, td .num { color: var(--text); }
+td.files { font-family: var(--mono); font-size: 11px; color: var(--faint); max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+.tbl-foot { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-top: 1px solid var(--divider);
+            font-family: var(--mono); font-size: 10.5px; color: var(--faint); letter-spacing: .04em; }
+
+/* ── Settings list ── */
+.kv-list { display: grid; }
+.kv-row { display: grid; grid-template-columns: 150px minmax(0,1fr); gap: 12px; padding: 9px 14px; border-bottom: 1px solid var(--divider); align-items: center; }
+.kv-row:last-child { border-bottom: 0; }
+.kv-row .k { font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.kv-row .v { font-family: var(--mono); font-size: 12px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kv-row .v.wrap { white-space: normal; word-break: break-all; }
 
 /* ── Toast ── */
-#toast { position: fixed; bottom: 24px; right: 24px; background: var(--card);
-          border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px;
-          font-size: 13px; transform: translateY(80px); opacity: 0;
-          transition: all .3s; z-index: 999; max-width: 340px; line-height:1.5; }
-#toast.show { transform: translateY(0); opacity: 1; }
-#toast.ok   { border-left: 3px solid var(--green); }
-#toast.err  { border-left: 3px solid var(--red); }
-#toast.warn { border-left: 3px solid var(--yellow); }
+#toast { position: fixed; right: 20px; bottom: 20px; z-index: 50; display: flex; align-items: center; gap: 10px; max-width: 380px;
+         padding: 10px 14px; background: var(--card-2); border: 1px solid var(--border-2); border-radius: var(--r-md);
+         box-shadow: 0 10px 30px -8px rgba(0,0,0,.7); font-size: 13px; transform: translateY(12px); opacity: 0;
+         pointer-events: none; transition: transform .2s ease, opacity .2s ease; }
+#toast.show { transform: none; opacity: 1; }
+#toast .i { font-size: 16px; }
+#toast.ok .i { color: var(--ok); } #toast.err .i { color: var(--err); } #toast.warn .i { color: var(--warn); }
 
-/* ── Skipped ── */
-.skipped-box { background: rgba(240,96,96,.06); border: 1px solid rgba(240,96,96,.3);
-                border-radius: 8px; padding: 12px; font-size: 12px; font-family: var(--mono);
-                color: var(--red); max-height: 120px; overflow-y: auto; word-break: break-all; }
-
-/* ── Scrollbar global ── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-2); background-clip: padding-box; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
 </style>
 </head>
 <body>
 
-<!-- Sidebar -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4M8 8l4-4 4 4"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M8 11l4 4 4-4"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></symbol>
+  <symbol id="i-convert" viewBox="0 0 24 24"><path d="M4 8h13l-3-3M20 16H7l3 3"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M4 10a8 8 0 0 1 14-5.3M20 4v5h-5"/><path d="M20 14a8 8 0 0 1-14 5.3M4 20v-5h5"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M3 20h18"/></symbol>
+  <symbol id="i-log" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></symbol>
+  <symbol id="i-warning" viewBox="0 0 24 24"><path d="M12 3l10 18H2L12 3z"/><path d="M12 10v4"/><path d="M12 17.2v.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.8v.01"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M4 12l5 5L20 6"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16 9.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/><path d="M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5l12 7.5-12 7.5v-15z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
+  <symbol id="i-clipboard" viewBox="0 0 24 24"><rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4V3h6v1"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h9l5 5v13H6V3z"/><path d="M14 3v5h5"/></symbol>
+  <symbol id="i-sheet" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M4 9h16M4 15h16M10 9v12"/></symbol>
+  <symbol id="i-braces" viewBox="0 0 24 24"><path d="M8 4c-2 0-3 1-3 3v2c0 1.5-1 2.5-2 3 1 .5 2 1.5 2 3v2c0 2 1 3 3 3M16 4c2 0 3 1 3 3v2c0 1.5 1 2.5 2 3-1 .5-2 1.5-2 3v2c0 2-1 3-3 3"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6C3.8 8.4 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></symbol>
+  <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
+  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4V3z"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+</svg>
+
 <aside class="sidebar">
-  <div class="logo">
-    <h1>MANGADEX<br>EXPORTER</h1>
-    <small>v2.0 — Web Edition</small>
+  <div class="brand">
+    <span class="brand-mark"><svg class="i"><use href="#i-bolt"/></svg></span>
+    <div>
+      <div class="brand-name">MangaDex<b>SYNC</b></div>
+      <span class="brand-ver" id="brandVer">v2.2.0</span>
+    </div>
   </div>
-  <nav>
-    <div class="nav-item active" data-page="export">
-      <span class="nav-icon">📤</span> Export
-    </div>
-    <div class="nav-item" data-page="convert">
-      <span class="nav-icon">🔄</span> Convert
-    </div>
-    <div class="nav-item" data-page="import">
-      <span class="nav-icon">📥</span> Import
-    </div>
-    <div class="nav-item" data-page="history">
-      <span class="nav-icon">📋</span> History
-    </div>
-    <div class="nav-item" data-page="settings">
-      <span class="nav-icon">⚙️</span> Settings
-    </div>
+  <div class="nav-label">Workspace</div>
+  <nav aria-label="Main">
+    <button class="nav-item active" data-page="export" data-label="Export"><svg class="i"><use href="#i-upload"/></svg>Export<kbd>1</kbd></button>
+    <button class="nav-item" data-page="convert" data-label="Convert"><svg class="i"><use href="#i-convert"/></svg>Convert<kbd>2</kbd></button>
+    <button class="nav-item" data-page="import" data-label="Import"><svg class="i"><use href="#i-download"/></svg>Import<kbd>3</kbd></button>
+    <button class="nav-item" data-page="history" data-label="History"><svg class="i"><use href="#i-history"/></svg>History<kbd>4</kbd></button>
+    <button class="nav-item" data-page="settings" data-label="Settings"><svg class="i"><use href="#i-settings"/></svg>Settings<kbd>5</kbd></button>
   </nav>
-  <div class="sidebar-footer">
-    <span class="status-dot idle" id="globalDot"></span>
-    <span id="globalLabel" style="font-size:12px;color:var(--muted)">Ready</span>
+  <div class="side-foot" role="status">
+    <div class="kv"><span>Session</span><span><i class="dot" id="sideDot"></i><span id="sideState">Idle</span></span></div>
+    <div class="kv"><span>Checkpoint</span><span id="sideCp">None</span></div>
+    <div class="kv"><span>Last run</span><span id="sideLast">Never</span></div>
   </div>
 </aside>
 
-<!-- Main -->
 <div class="main">
-  <div class="topbar">
-    <h2 id="pageTitle">Export</h2>
-    <div class="topbar-right">
-      <span class="badge" id="topProgress">—</span>
-      <span class="badge" style="color:var(--accent)" id="topEta"></span>
+  <header class="topbar">
+    <div class="crumbs"><span>Sync console</span><span class="sep">/</span><span id="pageTitle">Export</span></div>
+    <div class="top-right">
+      <div class="run-meter" id="runMeter" hidden>
+        <i class="dot live"></i><span class="pct" id="topPct">0%</span>
+        <span class="mini"><i id="topFill"></i></span>
+        <span class="eta" id="topEta"></span>
+      </div>
+      <span class="pill" id="topState"><i class="dot"></i>Idle</span>
     </div>
-  </div>
+  </header>
 
-  <div class="content">
+  <main class="content">
 
-    <!-- ═══ EXPORT PAGE ═══ -->
-    <div class="page active" id="page-export">
-      <div class="two-col">
-
-        <!-- Left -->
+    <!-- ═══ EXPORT ═══ -->
+    <section class="page active" id="page-export">
+      <div class="page-head">
         <div>
+          <h1>Export library</h1>
+          <p>Pull your MangaDex statuses, ratings and read progress into MyAnimeList, AniList and JSON files.</p>
+        </div>
+        <div class="head-meta">
+          <span class="pill accent" id="headMode">Mode <span class="val">Fast</span></span>
+          <span class="pill" id="headFormats">Formats <span class="val">3</span></span>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="col">
           <div class="card">
-            <div class="card-title">🔑 Credentials</div>
-            <div class="field">
-              <label>Client ID</label>
-              <div class="input-row">
-                <input type="text" id="clientId" placeholder="your-client-id">
-                <button class="btn btn-sm" onclick="paste('clientId')">Paste</button>
-              </div>
+            <div class="card-hd">
+              <div class="card-t"><span class="step">01 //</span>Credentials</div>
+              <div class="card-tools"><span class="sub-note" id="expAuthNote"></span><span class="pill" id="expAuthPill">Unverified</span></div>
             </div>
-            <div class="field">
-              <label>Client Secret</label>
-              <div class="input-row">
-                <input type="password" id="clientSecret" placeholder="••••••••">
-                <button class="btn btn-sm" onclick="paste('clientSecret')">Paste</button>
+            <div class="card-bd">
+              <div class="field">
+                <div class="lbl"><label for="clientId">Client ID</label><span class="h">From mangadex.org/settings</span></div>
+                <div class="control"><span class="pre">&gt;</span><input id="clientId" class="mono cred" data-grp="exp" placeholder="personal-client-xxxxxxxx" autocomplete="off" spellcheck="false">
+                  <button class="ctl-btn" onclick="paste('clientId')">Paste</button></div>
               </div>
-            </div>
-            <div class="field">
-              <label>Username</label>
-              <div class="input-row">
-                <input type="text" id="username" placeholder="mangadex username">
-                <button class="btn btn-sm" onclick="paste('username')">Paste</button>
+              <div class="field">
+                <div class="lbl"><label for="clientSecret">Client secret</label></div>
+                <div class="control"><span class="pre">&gt;</span><input id="clientSecret" type="password" class="mono cred" data-grp="exp" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="off">
+                  <button class="ctl-btn icon" onclick="toggleVis('clientSecret', this)" aria-label="Show client secret"><svg class="i"><use href="#i-eye"/></svg></button>
+                  <button class="ctl-btn" onclick="paste('clientSecret')">Paste</button></div>
               </div>
-            </div>
-            <div class="field">
-              <label>Password</label>
-              <div class="input-row">
-                <input type="password" id="password" placeholder="••••••••">
-                <button class="btn btn-sm" onclick="paste('password')">Paste</button>
+              <div class="row-2">
+                <div>
+                  <div class="lbl"><label for="username">Username</label></div>
+                  <div class="control"><input id="username" class="cred" data-grp="exp" placeholder="MangaDex username" autocomplete="username"></div>
+                </div>
+                <div>
+                  <div class="lbl"><label for="password">Password</label></div>
+                  <div class="control"><input id="password" type="password" class="cred" data-grp="exp" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="current-password">
+                    <button class="ctl-btn icon" onclick="toggleVis('password', this)" aria-label="Show password"><svg class="i"><use href="#i-eye"/></svg></button></div>
+                </div>
               </div>
-            </div>
-            <button class="btn" onclick="testCreds()" style="margin-top:4px">✓ Test Credentials</button>
-          </div>
-
-          <div class="card">
-            <div class="card-title">👤 MAL Info <small style="font-weight:300;color:var(--muted)">(for XML header)</small></div>
-            <div class="field">
-              <label>MAL User ID</label>
-              <div class="input-row">
-                <input type="text" id="malUserId" placeholder="Find in your MAL export XML">
-                <button class="btn btn-sm" onclick="paste('malUserId')">Paste</button>
-              </div>
-            </div>
-            <div class="field">
-              <label>MAL Username</label>
-              <div class="input-row">
-                <input type="text" id="malUsername" placeholder="your MAL username">
-                <button class="btn btn-sm" onclick="paste('malUsername')">Paste</button>
+              <div class="action-row" style="margin-top:14px">
+                <button class="btn" id="btnVerifyExp" onclick="verifyCreds('exp')"><svg class="i"><use href="#i-shield"/></svg>Verify credentials</button>
               </div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-title">⚙️ Options</div>
-            <div class="field">
-              <label>Mode</label>
-              <div class="mode-group">
-                <div class="mode-btn active" data-mode="fast" onclick="setMode('fast')">
-                  <span class="mode-label">⚡ Fast</span>
-                  <span class="mode-desc">Status only — minutes</span>
+            <div class="card-hd">
+              <div class="card-t"><span class="step">02 //</span>MyAnimeList profile</div>
+              <span class="pill">Optional</span>
+            </div>
+            <div class="card-bd">
+              <div class="row-2">
+                <div>
+                  <div class="lbl"><label for="malUserId">MAL user ID</label></div>
+                  <div class="control"><input id="malUserId" class="mono" placeholder="1428591" inputmode="numeric">
+                    <button class="ctl-btn" onclick="paste('malUserId')">Paste</button></div>
                 </div>
-                <div class="mode-btn" data-mode="deep" onclick="setMode('deep')">
-                  <span class="mode-label">🔍 Deep</span>
-                  <span class="mode-desc">Last chapter — slower</span>
+                <div>
+                  <div class="lbl"><label for="malUsername">MAL username</label></div>
+                  <div class="control"><input id="malUsername" placeholder="Your MAL username">
+                    <button class="ctl-btn" onclick="paste('malUsername')">Paste</button></div>
                 </div>
               </div>
+              <p class="sub-note" style="margin-top:10px">Only written into the XML header. MAL identifies you by your login when you upload.</p>
             </div>
-            <div class="field">
-              <label>Save Folder</label>
-              <div class="input-row">
-                <input type="text" id="saveDir" placeholder="/path/to/folder">
-                <button class="btn btn-sm" onclick="browseFolder('saveDir')">📁 Browse</button>
+          </div>
+
+          <div class="card">
+            <div class="card-hd">
+              <div class="card-t"><span class="step">03 //</span>Export parameters</div>
+              <span class="pill" id="paramMode">Profile <span class="val">Fast</span></span>
+            </div>
+            <div class="card-bd">
+              <div class="sect-lbl"><span>Extraction mode</span></div>
+              <div class="seg" role="radiogroup" aria-label="Extraction mode">
+                <button class="seg-opt active" data-mode="fast" role="radio" aria-checked="true" onclick="setMode('fast')">
+                  <span class="t"><svg class="i"><use href="#i-bolt"/></svg>Fast</span>
+                  <span class="s">Statuses, ratings and titles. Done in minutes.</span>
+                </button>
+                <button class="seg-opt" data-mode="deep" role="radio" aria-checked="false" onclick="setMode('deep')">
+                  <span class="t"><svg class="i"><use href="#i-layers"/></svg>Deep</span>
+                  <span class="s">Adds last read chapter and volume. Much slower.</span>
+                </button>
               </div>
-            </div>
-            <div class="field">
-              <label>Export Formats</label>
-              <div class="checks">
-                <label class="check-item"><input type="checkbox" id="fmtMal" checked> MAL XML + .gz</label>
-                <label class="check-item"><input type="checkbox" id="fmtAl" checked> AniList XML</label>
-                <label class="check-item"><input type="checkbox" id="fmtJson" checked> JSON backup</label>
-                <label class="check-item"><input type="checkbox" id="dryRun"> 🔍 Dry Run</label>
+              <div class="field" style="margin-top:14px">
+                <div class="lbl"><label for="saveDir">Save folder</label><span class="h">Blank saves to the working directory</span></div>
+                <div class="control"><span class="pre"><svg class="i"><use href="#i-folder"/></svg></span><input id="saveDir" class="mono" placeholder="/path/to/exports">
+                  <button class="ctl-btn" onclick="browseFolder('saveDir')">Browse</button></div>
+              </div>
+              <div class="sect-lbl" style="margin-top:14px"><span>Output formats</span><span class="h">XLSX is always written for Convert</span></div>
+              <div class="opts">
+                <label class="opt"><input type="checkbox" id="fmtMal" checked onchange="refreshHeadMeta()"><span><span class="ot">MAL XML</span><span class="os">Plus a compressed .gz copy</span></span></label>
+                <label class="opt"><input type="checkbox" id="fmtAl" checked onchange="refreshHeadMeta()"><span><span class="ot">AniList XML</span><span class="os">Same schema, for AniList's importer</span></span></label>
+                <label class="opt"><input type="checkbox" id="fmtJson" checked onchange="refreshHeadMeta()"><span><span class="ot">JSON backup</span><span class="os">Full data, used by Import</span></span></label>
+                <label class="opt"><input type="checkbox" id="dryRun"><span><span class="ot">Dry run</span><span class="os">Simulate the run, write no files</span></span></label>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- Right -->
-        <div>
+        <div class="col">
           <div class="card">
-            <div class="card-title">🚀 Extract</div>
-            <button class="btn btn-primary" style="width:100%;font-size:15px;padding:14px;margin-bottom:12px"
-                    id="btnAll" onclick="startExport(null)">
-              ⚡ Extract Entire Library
-            </button>
-            <div class="status-chips" id="statusChips">
-              <div class="chip" data-status="reading"      onclick="startExport('reading')">Reading</div>
-              <div class="chip" data-status="completed"    onclick="startExport('completed')">Completed</div>
-              <div class="chip" data-status="on_hold"      onclick="startExport('on_hold')">On-Hold</div>
-              <div class="chip" data-status="dropped"      onclick="startExport('dropped')">Dropped</div>
-              <div class="chip" data-status="plan_to_read" onclick="startExport('plan_to_read')">Plan to Read</div>
-              <div class="chip" data-status="re_reading"   onclick="startExport('re_reading')">Re-reading</div>
-            </div>
-            <div style="display:flex;gap:8px;margin-top:12px">
-              <button class="btn" id="btnResume" onclick="resumeExport()" style="flex:1" disabled>
-                ▶ Resume
-              </button>
-              <button class="btn btn-danger" id="btnStop" onclick="stopExport()" style="flex:1" disabled>
-                ⏹ Stop
-              </button>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-title">📊 Progress</div>
-            <div class="progress-wrap">
-              <div class="progress-bar-bg">
-                <div class="progress-bar-fill" id="progFill"></div>
-              </div>
-              <div class="progress-meta">
-                <span id="progLabel">Ready</span>
-                <span id="progEta"></span>
+            <div class="card-hd">
+              <div class="card-t"><span class="step">04 //</span>Extract</div>
+              <div class="card-tools">
+                <span class="pill" id="libTotal" hidden>Library <span class="val" id="libTotalN">0</span></span>
+                <button class="btn btn-sm" id="btnCounts" onclick="refreshCounts()"><svg class="i"><use href="#i-refresh"/></svg>Load counts</button>
               </div>
             </div>
+            <div class="card-bd">
+              <div class="sect-lbl"><span>Export one status</span><span class="h" id="countsHint">Counts load from your library</span></div>
+              <div class="st-grid" id="statusChips">
+                <button class="st" data-status="reading" onclick="startExport('reading')">Reading<span class="cnt" id="count-reading"><svg class="i go"><use href="#i-arrow"/></svg></span></button>
+                <button class="st" data-status="completed" onclick="startExport('completed')">Completed<span class="cnt" id="count-completed"><svg class="i go"><use href="#i-arrow"/></svg></span></button>
+                <button class="st" data-status="on_hold" onclick="startExport('on_hold')">On-hold<span class="cnt" id="count-on_hold"><svg class="i go"><use href="#i-arrow"/></svg></span></button>
+                <button class="st" data-status="dropped" onclick="startExport('dropped')">Dropped<span class="cnt" id="count-dropped"><svg class="i go"><use href="#i-arrow"/></svg></span></button>
+                <button class="st" data-status="plan_to_read" onclick="startExport('plan_to_read')">Plan to read<span class="cnt" id="count-plan_to_read"><svg class="i go"><use href="#i-arrow"/></svg></span></button>
+                <button class="st" data-status="re_reading" onclick="startExport('re_reading')">Re-reading<span class="cnt" id="count-re_reading"><svg class="i go"><use href="#i-arrow"/></svg></span></button>
+              </div>
+              <div class="divider"></div>
+              <div class="action-row">
+                <button class="btn btn-primary btn-lg grow" id="btnAll" onclick="startExport(null)"><svg class="i"><use href="#i-bolt"/></svg>Extract entire library<span class="count" id="btnAllCount"></span></button>
+                <button class="btn btn-lg" id="btnResume" onclick="resumeExport()" disabled><svg class="i"><use href="#i-play"/></svg>Resume</button>
+                <button class="btn btn-lg btn-danger" id="btnStop" onclick="stopRun()" disabled><svg class="i"><use href="#i-stop"/></svg>Stop</button>
+              </div>
+              <div class="hints"><span><kbd>Ctrl</kbd><kbd>Enter</kbd> Extract all</span><span><kbd>Esc</kbd> Stop</span></div>
+            </div>
           </div>
 
-          <div class="card" style="flex:1">
-            <div class="card-title" style="justify-content:space-between">
-              📝 Log
-              <button class="btn btn-xs" onclick="clearLog()">Clear</button>
+          <div class="card">
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-chart"/></svg>Progress</div>
+              <span class="pill" data-state-pill><i class="dot"></i>Idle</span>
             </div>
-            <div class="log-box" id="logBox"></div>
+            <div class="card-bd">
+              <div class="prog-top">
+                <div class="prog-pct idle" id="progPct">0<small>%</small></div>
+                <div class="prog-label" id="progLabel">Nothing running. Start an export to see live progress.</div>
+              </div>
+              <div class="track"><div class="fill" id="progFill" role="progressbar" aria-label="Export progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
+              <div class="prog-meta">
+                <div><span class="k">ETA</span><span class="v" id="progEta">-</span></div>
+                <div><span class="k">Mode</span><span class="v" id="progMode">Fast</span></div>
+                <div><span class="k">Checkpoint</span><span class="v" data-cp-text>None</span></div>
+              </div>
+            </div>
           </div>
 
-          <div class="card" id="skippedCard" style="display:none">
-            <div class="card-title" style="justify-content:space-between">
-              ⚠️ No MAL ID — Add Manually
-              <span id="skippedCount" style="font-size:11px;color:var(--yellow);font-family:var(--mono)"></span>
+          <div class="card">
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-log"/></svg>Live log</div>
+              <div class="card-tools">
+                <span class="pill" id="logBoxCount">0 lines</span>
+                <button class="pill toggle-pill ok" id="logBoxAuto" onclick="toggleAuto('logBox')" aria-pressed="true">Autoscroll on</button>
+                <button class="btn btn-sm btn-ghost" onclick="clearLog('logBox')"><svg class="i"><use href="#i-x"/></svg>Clear</button>
+              </div>
             </div>
-            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
-              These manga were skipped because MangaDex has no MAL link for them. Add them manually on MAL/AniList.
+            <div class="log-wrap">
+              <div class="log-box" id="logBox" role="log" aria-live="polite" aria-label="Export log"></div>
+              <div class="log-empty" id="logBoxEmpty"><svg class="i"><use href="#i-log"/></svg><span class="t">Waiting for activity<span class="caret"></span></span><span class="s">Auth, fetch and file events stream here the moment a run starts.</span></div>
             </div>
-            <div id="skippedList" style="
-              display:flex;flex-wrap:wrap;gap:6px;max-height:160px;
-              overflow-y:auto;padding:4px 0;
-            "></div>
+          </div>
+
+          <div class="card" id="skippedCard" hidden>
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-warning"/></svg>Skipped: no MAL ID</div>
+              <div class="card-tools"><span class="pill warn" id="skippedCount">0 titles</span>
+                <button class="btn btn-sm btn-ghost" onclick="copyList(lastSkipped)"><svg class="i"><use href="#i-copy"/></svg>Copy all</button></div>
+            </div>
+            <div class="card-bd flush"><div class="row-list" id="skippedList"></div></div>
           </div>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- ═══ CONVERT PAGE ═══ -->
-    <div class="page" id="page-convert">
-      <div class="two-col">
+    <!-- ═══ CONVERT ═══ -->
+    <section class="page" id="page-convert">
+      <div class="page-head">
         <div>
+          <h1>Convert exports</h1>
+          <p>Turn exported .xlsx files into MyAnimeList and AniList import files, without touching the API.</p>
+        </div>
+        <div class="head-meta"><span class="pill" id="convFilesPill">Files <span class="val">0</span></span></div>
+      </div>
+      <div class="grid-2">
+        <div class="col">
           <div class="card">
-            <div class="card-title">👤 MAL Info</div>
-            <div class="field">
-              <label>MAL User ID</label>
-              <div class="input-row">
-                <input type="text" id="convMalId" placeholder="from your MAL export XML">
-                <button class="btn btn-sm" onclick="paste('convMalId')">Paste</button>
-              </div>
+            <div class="card-hd">
+              <div class="card-t"><span class="step">01 //</span>MyAnimeList profile</div>
+              <span class="pill accent">Required</span>
             </div>
-            <div class="field">
-              <label>MAL Username</label>
-              <div class="input-row">
-                <input type="text" id="convMalName" placeholder="your MAL username">
-                <button class="btn btn-sm" onclick="paste('convMalName')">Paste</button>
+            <div class="card-bd">
+              <div class="row-2">
+                <div>
+                  <div class="lbl"><label for="convMalId">MAL user ID</label></div>
+                  <div class="control"><input id="convMalId" class="mono" placeholder="1428591" inputmode="numeric">
+                    <button class="ctl-btn" onclick="paste('convMalId')">Paste</button></div>
+                </div>
+                <div>
+                  <div class="lbl"><label for="convMalName">MAL username</label></div>
+                  <div class="control"><input id="convMalName" placeholder="Your MAL username">
+                    <button class="ctl-btn" onclick="paste('convMalName')">Paste</button></div>
+                </div>
+              </div>
+              <div class="action-row" style="margin-top:12px"><button class="btn btn-sm btn-ghost" onclick="copyMalFromExport()"><svg class="i"><use href="#i-copy"/></svg>Use values from Export</button></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-hd"><div class="card-t"><span class="step">02 //</span>Output</div></div>
+            <div class="card-bd">
+              <div class="field">
+                <div class="lbl"><label for="convSaveDir">Output folder</label><span class="h">Auto-fill uses the export folder</span></div>
+                <div class="control"><span class="pre"><svg class="i"><use href="#i-folder"/></svg></span><input id="convSaveDir" class="mono" placeholder="/path/to/output">
+                  <button class="ctl-btn" onclick="browseFolder('convSaveDir')">Browse</button></div>
+              </div>
+              <div class="opts" style="margin-top:14px">
+                <label class="opt"><input type="checkbox" id="convMal" checked><span><span class="ot">MAL XML</span><span class="os">Plus a compressed .gz copy</span></span></label>
+                <label class="opt"><input type="checkbox" id="convAl" checked><span><span class="ot">AniList XML</span><span class="os">For AniList's importer</span></span></label>
+                <label class="opt"><input type="checkbox" id="convScores" checked><span><span class="ot">Include scores</span><span class="os">Carry your 1-10 ratings</span></span></label>
+                <label class="opt"><input type="checkbox" id="convDry"><span><span class="ot">Dry run</span><span class="os">Count entries, write nothing</span></span></label>
               </div>
             </div>
           </div>
           <div class="card">
-            <div class="card-title">⚙️ Options</div>
-            <div class="field">
-              <label>Output Folder</label>
-              <div class="input-row">
-                <input type="text" id="convSaveDir" placeholder="/path/to/folder">
-                <button class="btn btn-sm" onclick="browseFolder('convSaveDir')">📁 Browse</button>
-              </div>
+            <div class="card-hd"><div class="card-t"><span class="step">03 //</span>Generate</div><span class="pill" id="convState">Ready</span></div>
+            <div class="card-bd">
+              <button class="btn btn-ok btn-lg" style="width:100%" id="btnGenerate" onclick="generateXml()"><svg class="i"><use href="#i-bolt"/></svg>Generate import files</button>
+              <div id="convResult" style="margin-top:12px" hidden></div>
             </div>
-            <div class="checks" style="flex-direction:column;gap:6px">
-              <label class="check-item"><input type="checkbox" id="convMal" checked> MAL XML + .gz</label>
-              <label class="check-item"><input type="checkbox" id="convAl" checked> AniList XML</label>
-              <label class="check-item"><input type="checkbox" id="convScores" checked> Include Scores</label>
-              <label class="check-item"><input type="checkbox" id="convDry"> 🔍 Dry Run</label>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-title">⚡ Generate</div>
-            <button class="btn btn-success" style="width:100%;font-size:15px;padding:14px"
-                    onclick="generateXml()">⚡ Generate XML Files</button>
-            <div id="convResult" style="margin-top:12px;font-size:13px;color:var(--muted)"></div>
           </div>
         </div>
-        <div>
+        <div class="col">
           <div class="card">
-            <div class="card-title" style="justify-content:space-between">
-              📁 Excel Files
-              <div style="display:flex;gap:6px">
-                <button class="btn btn-xs" onclick="addFile()">+ Add</button>
-                <button class="btn btn-xs" onclick="autoFill()">⟳ Auto-fill</button>
-                <button class="btn btn-xs btn-danger" onclick="clearFiles()">✕ Clear</button>
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-sheet"/></svg>Excel files</div>
+              <div class="card-tools">
+                <button class="btn btn-sm" onclick="autoFill()"><svg class="i"><use href="#i-refresh"/></svg>Auto-fill</button>
+                <button class="btn btn-sm" onclick="addFile()"><svg class="i"><use href="#i-plus"/></svg>Add</button>
+                <button class="btn btn-sm btn-ghost" onclick="clearFiles()" aria-label="Clear all files"><svg class="i"><use href="#i-x"/></svg></button>
               </div>
             </div>
-            <div id="fileList" style="min-height:60px"></div>
-            <div style="color:var(--muted);font-size:11px;margin-top:8px">
-              Add the .xlsx files from the Export step. Status is auto-detected from filename.
-            </div>
+            <div class="card-bd flush"><div class="row-list" id="fileList" style="max-height:360px"></div></div>
           </div>
           <div class="card">
-            <div class="card-title">⚠️ Skipped Manga</div>
-            <div id="skippedBox" class="skipped-box">—</div>
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-warning"/></svg>Skipped manga</div>
+              <span class="pill" id="convSkipPill">None yet</span>
+            </div>
+            <div class="card-bd flush"><div class="row-list" id="skippedBox"></div></div>
           </div>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- ═══ IMPORT PAGE ═══ -->
-    <div class="page" id="page-import">
-      <div class="two-col">
+    <!-- ═══ IMPORT ═══ -->
+    <section class="page" id="page-import">
+      <div class="page-head">
         <div>
+          <h1>Import library</h1>
+          <p>Write statuses and ratings from a MAL or AniList XML, or a JSON backup, into your MangaDex account.</p>
+        </div>
+        <div class="head-meta"><span class="pill info" id="impTypePill">Source <span class="val">XML</span></span></div>
+      </div>
+      <div class="grid-2">
+        <div class="col">
           <div class="card">
-            <div class="card-title">🔑 Credentials</div>
-            <div class="field">
-              <label>Client ID</label>
-              <div class="input-row">
-                <input type="text" id="impClientId" placeholder="your-client-id">
-                <button class="btn btn-sm" onclick="paste('impClientId')">Paste</button>
-              </div>
+            <div class="card-hd">
+              <div class="card-t"><span class="step">01 //</span>Credentials</div>
+              <div class="card-tools"><span class="sub-note" id="impAuthNote"></span><span class="pill" id="impAuthPill">Unverified</span></div>
             </div>
-            <div class="field">
-              <label>Client Secret</label>
-              <div class="input-row">
-                <input type="password" id="impClientSecret" placeholder="••••••••">
-                <button class="btn btn-sm" onclick="paste('impClientSecret')">Paste</button>
+            <div class="card-bd">
+              <div class="field">
+                <div class="lbl"><label for="impClientId">Client ID</label></div>
+                <div class="control"><span class="pre">&gt;</span><input id="impClientId" class="mono cred" data-grp="imp" placeholder="personal-client-xxxxxxxx" autocomplete="off" spellcheck="false">
+                  <button class="ctl-btn" onclick="paste('impClientId')">Paste</button></div>
               </div>
-            </div>
-            <div class="field">
-              <label>Username</label>
-              <div class="input-row">
-                <input type="text" id="impUsername" placeholder="mangadex username">
-                <button class="btn btn-sm" onclick="paste('impUsername')">Paste</button>
+              <div class="field">
+                <div class="lbl"><label for="impClientSecret">Client secret</label></div>
+                <div class="control"><span class="pre">&gt;</span><input id="impClientSecret" type="password" class="mono cred" data-grp="imp" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="off">
+                  <button class="ctl-btn icon" onclick="toggleVis('impClientSecret', this)" aria-label="Show client secret"><svg class="i"><use href="#i-eye"/></svg></button>
+                  <button class="ctl-btn" onclick="paste('impClientSecret')">Paste</button></div>
               </div>
-            </div>
-            <div class="field">
-              <label>Password</label>
-              <div class="input-row">
-                <input type="password" id="impPassword" placeholder="••••••••">
-                <button class="btn btn-sm" onclick="paste('impPassword')">Paste</button>
+              <div class="row-2">
+                <div>
+                  <div class="lbl"><label for="impUsername">Username</label></div>
+                  <div class="control"><input id="impUsername" class="cred" data-grp="imp" placeholder="MangaDex username" autocomplete="username"></div>
+                </div>
+                <div>
+                  <div class="lbl"><label for="impPassword">Password</label></div>
+                  <div class="control"><input id="impPassword" type="password" class="cred" data-grp="imp" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="current-password">
+                    <button class="ctl-btn icon" onclick="toggleVis('impPassword', this)" aria-label="Show password"><svg class="i"><use href="#i-eye"/></svg></button></div>
+                </div>
+              </div>
+              <div class="action-row" style="margin-top:14px">
+                <button class="btn" id="btnVerifyImp" onclick="verifyCreds('imp')"><svg class="i"><use href="#i-shield"/></svg>Verify credentials</button>
+                <button class="btn btn-ghost" onclick="copyCredsFromExport()"><svg class="i"><use href="#i-copy"/></svg>Use Export credentials</button>
               </div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-title">📂 Source File</div>
-            <div class="field">
-              <label>File Type</label>
-              <div class="mode-group">
-                <div class="mode-btn active" data-imptype="xml" onclick="setImpType('xml')">
-                  <span class="mode-label">📄 MAL / AniList XML</span>
-                  <span class="mode-desc">mal_*.xml or anilist_*.xml</span>
-                </div>
-                <div class="mode-btn" data-imptype="json" onclick="setImpType('json')">
-                  <span class="mode-label">🗂 JSON Backup</span>
-                  <span class="mode-desc">mdex_*.json from Export tab</span>
-                </div>
+            <div class="card-hd"><div class="card-t"><span class="step">02 //</span>Source file</div></div>
+            <div class="card-bd">
+              <div class="seg" role="radiogroup" aria-label="Source file type">
+                <button class="seg-opt active" data-imptype="xml" role="radio" aria-checked="true" onclick="setImpType('xml')">
+                  <span class="t"><svg class="i"><use href="#i-code"/></svg>XML</span>
+                  <span class="s">mal_*.xml or anilist_*.xml exports</span>
+                </button>
+                <button class="seg-opt" data-imptype="json" role="radio" aria-checked="false" onclick="setImpType('json')">
+                  <span class="t"><svg class="i"><use href="#i-braces"/></svg>JSON backup</span>
+                  <span class="s">mdex_*.json from the Export tab</span>
+                </button>
               </div>
-            </div>
-            <div class="field">
-              <label>File Path</label>
-              <div class="input-row">
-                <input type="text" id="impFilePath" placeholder="/path/to/file.xml or file.json">
-                <button class="btn btn-sm" onclick="browseFile('impFilePath')">📁 Browse</button>
-                <button class="btn btn-sm" onclick="paste('impFilePath')">Paste</button>
+              <div class="field" style="margin-top:14px">
+                <div class="lbl"><label for="impFilePath">File path</label></div>
+                <div class="control"><span class="pre"><svg class="i"><use href="#i-file"/></svg></span><input id="impFilePath" class="mono" placeholder="/path/to/mal_reading.xml">
+                  <button class="ctl-btn" onclick="browseFile('impFilePath')">Browse</button>
+                  <button class="ctl-btn" onclick="paste('impFilePath')">Paste</button></div>
               </div>
-            </div>
-            <div id="impXmlNote" style="font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6">
-              ⚠️ <strong style="color:var(--yellow)">XML import is slow</strong> — each manga requires a MangaDex API lookup by MAL ID.
-              For large libraries (500+ manga) expect 10–30 min. Use JSON import when possible for instant speed.
-            </div>
-            <div id="impJsonNote" style="font-size:12px;color:var(--muted);margin-top:4px;line-height:1.6;display:none">
-              ✓ <strong style="color:var(--green)">JSON import is fast</strong> — uses MangaDex UUIDs directly from the backup, no extra lookups needed.
+              <div class="callout warn" id="impXmlNote" style="margin-top:12px">
+                <svg class="i"><use href="#i-warning"/></svg>
+                <span><span class="ct">Slow path</span><span class="cs">Every title needs a MangaDex lookup by MAL ID. Large libraries (500+) take 10 to 30 minutes.</span></span>
+              </div>
+              <div class="callout ok" id="impJsonNote" style="margin-top:12px" hidden>
+                <svg class="i"><use href="#i-check-circle"/></svg>
+                <span><span class="ct">Fast path</span><span class="cs">Uses the MangaDex IDs stored in the backup, so no lookups are needed.</span></span>
+              </div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-title">⚙️ Options</div>
-            <div class="checks" style="flex-direction:column;gap:6px">
-              <label class="check-item"><input type="checkbox" id="impScores" checked> Import Scores / Ratings</label>
-              <label class="check-item"><input type="checkbox" id="impDry"> 🔍 Dry Run (simulate, no changes made)</label>
+            <div class="card-hd"><div class="card-t"><span class="step">03 //</span>Options</div></div>
+            <div class="card-bd">
+              <div class="opts">
+                <label class="opt"><input type="checkbox" id="impScores" checked><span><span class="ot">Import ratings</span><span class="os">Writes 1-10 scores to MangaDex</span></span></label>
+                <label class="opt"><input type="checkbox" id="impDry"><span><span class="ot">Dry run</span><span class="os">Resolve titles, change nothing</span></span></label>
+              </div>
             </div>
           </div>
         </div>
 
-        <div>
+        <div class="col">
           <div class="card">
-            <div class="card-title">📥 Import</div>
-            <p style="font-size:13px;color:var(--muted);margin-bottom:14px;line-height:1.6">
-              This will set manga statuses and ratings on your MangaDex account.
-              Existing entries will be updated. Manga not found on MangaDex will be skipped.
-            </p>
-            <button class="btn btn-primary" style="width:100%;font-size:15px;padding:14px;margin-bottom:12px"
-                    id="btnImport" onclick="startImport()">
-              📥 Start Import
-            </button>
-            <button class="btn btn-danger" id="btnImportStop" onclick="stopExport()" style="width:100%" disabled>
-              ⏹ Stop
-            </button>
-          </div>
-
-          <div class="card">
-            <div class="card-title">📊 Progress</div>
-            <div class="progress-wrap">
-              <div class="progress-bar-bg">
-                <div class="progress-bar-fill" id="impProgFill"></div>
+            <div class="card-hd"><div class="card-t"><span class="step">04 //</span>Run import</div><span class="pill" data-state-pill><i class="dot"></i>Idle</span></div>
+            <div class="card-bd">
+              <div class="callout info" style="margin-bottom:14px">
+                <svg class="i"><use href="#i-info"/></svg>
+                <span><span class="ct">Writes to your account</span><span class="cs">Sets statuses and ratings on MangaDex. Existing entries are updated. Titles that can't be found are skipped and listed below.</span></span>
               </div>
-              <div class="progress-meta">
-                <span id="impProgLabel">Ready</span>
+              <div class="action-row">
+                <button class="btn btn-primary btn-lg grow" id="btnImport" onclick="startImport()"><svg class="i"><use href="#i-download"/></svg>Start import</button>
+                <button class="btn btn-lg btn-danger" id="btnImportStop" onclick="stopRun()" disabled><svg class="i"><use href="#i-stop"/></svg>Stop</button>
               </div>
+              <div class="hints"><span><kbd>Ctrl</kbd><kbd>Enter</kbd> Start import</span><span><kbd>Esc</kbd> Stop</span></div>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-title" style="justify-content:space-between">
-              📝 Log
-              <button class="btn btn-xs" onclick="clearLog()">Clear</button>
+            <div class="card-hd"><div class="card-t"><svg class="i"><use href="#i-chart"/></svg>Progress</div><span class="pill" data-state-pill><i class="dot"></i>Idle</span></div>
+            <div class="card-bd">
+              <div class="prog-top">
+                <div class="prog-pct idle" id="impProgPct">0<small>%</small></div>
+                <div class="prog-label" id="impProgLabel">Nothing running. Start an import to see live progress.</div>
+              </div>
+              <div class="track"><div class="fill" id="impProgFill" role="progressbar" aria-label="Import progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
             </div>
-            <div class="log-box" id="logBox2"></div>
           </div>
 
-          <div class="card" id="impSkippedCard" style="display:none">
-            <div class="card-title">
-              ⚠️ Skipped
-              <span id="impSkippedCount" style="font-size:11px;color:var(--yellow);font-family:var(--mono);margin-left:8px"></span>
+          <div class="card">
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-log"/></svg>Live log</div>
+              <div class="card-tools">
+                <span class="pill" id="logBox2Count">0 lines</span>
+                <button class="pill toggle-pill ok" id="logBox2Auto" onclick="toggleAuto('logBox2')" aria-pressed="true">Autoscroll on</button>
+                <button class="btn btn-sm btn-ghost" onclick="clearLog('logBox2')"><svg class="i"><use href="#i-x"/></svg>Clear</button>
+              </div>
             </div>
-            <div id="impSkippedList" style="display:flex;flex-wrap:wrap;gap:6px;max-height:140px;overflow-y:auto;padding:4px 0"></div>
+            <div class="log-wrap">
+              <div class="log-box" id="logBox2" role="log" aria-live="polite" aria-label="Import log"></div>
+              <div class="log-empty" id="logBox2Empty"><svg class="i"><use href="#i-log"/></svg><span class="t">Waiting for activity<span class="caret"></span></span><span class="s">Lookups, status writes and skips stream here during an import.</span></div>
+            </div>
+          </div>
+
+          <div class="card" id="impSkippedCard" hidden>
+            <div class="card-hd">
+              <div class="card-t"><svg class="i"><use href="#i-warning"/></svg>Skipped</div>
+              <div class="card-tools"><span class="pill warn" id="impSkippedCount">0 titles</span>
+                <button class="btn btn-sm btn-ghost" onclick="copyList(lastSkipped)"><svg class="i"><use href="#i-copy"/></svg>Copy all</button></div>
+            </div>
+            <div class="card-bd flush"><div class="row-list" id="impSkippedList"></div></div>
           </div>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- ═══ HISTORY PAGE ═══ -->
-    <div class="page" id="page-history">
+    <!-- ═══ HISTORY ═══ -->
+    <section class="page" id="page-history">
+      <div class="page-head">
+        <div>
+          <h1>Run history</h1>
+          <p>Every export, import and convert run on this machine, newest first.</p>
+        </div>
+        <div class="head-meta">
+          <button class="btn btn-sm" onclick="loadHistory()"><svg class="i"><use href="#i-refresh"/></svg>Refresh</button>
+          <button class="btn btn-sm btn-danger" onclick="clearHistory()"><svg class="i"><use href="#i-trash"/></svg>Clear history</button>
+        </div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="stat-hd">Total runs<svg class="i"><use href="#i-history"/></svg></div><div class="stat-v" id="statRuns">0</div><div class="stat-s" id="statRunsSub">No runs yet</div></div>
+        <div class="stat"><div class="stat-hd">Titles processed<svg class="i"><use href="#i-layers"/></svg></div><div class="stat-v" id="statTitles">0</div><div class="stat-s" id="statTitlesSub">Across all runs</div></div>
+        <div class="stat"><div class="stat-hd">Avg duration<svg class="i"><use href="#i-clock"/></svg></div><div class="stat-v" id="statElapsed">-</div><div class="stat-s" id="statElapsedSub">Export and import runs</div></div>
+        <div class="stat ok"><div class="stat-hd">Match rate<svg class="i"><use href="#i-check-circle"/></svg></div><div class="stat-v" id="statRate">-</div><div class="stat-s" id="statRateSub">Titles not skipped</div></div>
+      </div>
       <div class="card">
-        <div class="card-title" style="justify-content:space-between">
-          📋 Export History
-          <span style="display:flex;gap:6px">
-            <button class="btn btn-xs" onclick="loadHistory()">🔄 Refresh</button>
-            <button class="btn btn-xs btn-danger" onclick="clearHistory()">🗑️ Clear</button>
-          </span>
+        <div class="filterbar">
+          <div class="control"><span class="pre">&gt;</span><input id="historySearch" class="mono" placeholder="Filter by date, type, mode or file name" oninput="renderHistory()"></div>
+          <div class="tabs" role="tablist" id="histTabs">
+            <button class="tab active" data-f="all" onclick="setHistFilter('all')">All<span class="n" id="hn-all">0</span></button>
+            <button class="tab" data-f="export" onclick="setHistFilter('export')">Export<span class="n" id="hn-export">0</span></button>
+            <button class="tab" data-f="import" onclick="setHistFilter('import')">Import<span class="n" id="hn-import">0</span></button>
+            <button class="tab" data-f="convert" onclick="setHistFilter('convert')">Convert<span class="n" id="hn-convert">0</span></button>
+          </div>
         </div>
-        <div class="table-wrap">
+        <div class="tbl-wrap">
           <table>
-            <thead><tr>
-              <th>Date</th><th>Type</th><th>Total</th><th>Skipped</th>
-              <th>Mode</th><th>Elapsed</th><th>Files</th>
-            </tr></thead>
-            <tbody id="historyBody">
-              <tr><td colspan="7" style="color:var(--muted);text-align:center;padding:30px">
-                No history yet
-              </td></tr>
-            </tbody>
+            <thead><tr><th>Date</th><th>Operation</th><th>Scope</th><th class="r">Total</th><th class="r">Skipped</th><th>Mode</th><th class="r">Elapsed</th><th>Files</th></tr></thead>
+            <tbody id="historyBody"></tbody>
           </table>
         </div>
+        <div class="empty" id="historyEmpty" hidden><svg class="i"><use href="#i-history"/></svg><span class="t" id="historyEmptyT">No runs yet</span><span class="s" id="historyEmptyS">Your first export, import or convert shows up here with totals, timing and output files.</span></div>
+        <div class="tbl-foot"><span id="histFoot">Showing 0 of 0 runs</span><span>Stored in mdex_history.json (last 100)</span></div>
       </div>
-    </div>
+    </section>
 
-    <!-- ═══ SETTINGS PAGE ═══ -->
-    <div class="page" id="page-settings">
-      <div class="two-col">
+    <!-- ═══ SETTINGS ═══ -->
+    <section class="page" id="page-settings">
+      <div class="page-head">
         <div>
+          <h1>Settings</h1>
+          <p>Defaults, the saved resume checkpoint, and details about this local install.</p>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="col">
           <div class="card">
-            <div class="card-title">🎯 Default Mode</div>
-            <div class="mode-group">
-              <div class="mode-btn active" data-smode="fast" onclick="setSettingsMode('fast')">
-                <span class="mode-label">⚡ Fast</span>
-                <span class="mode-desc">Status + title only<br>Recommended for most users</span>
-              </div>
-              <div class="mode-btn" data-smode="deep" onclick="setSettingsMode('deep')">
-                <span class="mode-label">🔍 Deep</span>
-                <span class="mode-desc">Last read chapter<br>Slower but more accurate</span>
+            <div class="card-hd"><div class="card-t"><svg class="i"><use href="#i-layers"/></svg>Default mode</div><span class="pill accent" id="setModePill">Fast</span></div>
+            <div class="card-bd">
+              <div class="seg" role="radiogroup" aria-label="Default export mode">
+                <button class="seg-opt active" data-smode="fast" role="radio" aria-checked="true" onclick="setSettingsMode('fast')">
+                  <span class="t"><svg class="i"><use href="#i-bolt"/></svg>Fast</span><span class="s">Recommended for most libraries</span>
+                </button>
+                <button class="seg-opt" data-smode="deep" role="radio" aria-checked="false" onclick="setSettingsMode('deep')">
+                  <span class="t"><svg class="i"><use href="#i-layers"/></svg>Deep</span><span class="s">Includes last read chapter and volume</span>
+                </button>
               </div>
             </div>
           </div>
           <div class="card">
-            <div class="card-title">🔖 Checkpoint</div>
-            <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
-              If an export was interrupted, you can resume it from the Export tab.
-              Clear the checkpoint if you want to start fresh.
-            </p>
-            <button class="btn btn-danger" onclick="clearCheckpoint()">✕ Clear Checkpoint</button>
-            <div id="cpInfo" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+            <div class="card-hd"><div class="card-t"><svg class="i"><use href="#i-bookmark"/></svg>Resume checkpoint</div><span class="pill" id="cpPill">None</span></div>
+            <div class="card-bd">
+              <p style="color:var(--text-2)" id="cpInfo">No checkpoint on disk.</p>
+              <p class="sub-note" style="margin-top:6px">Saved after each finished status group, so an interrupted export can resume from the Export tab.</p>
+              <div class="action-row" style="margin-top:14px"><button class="btn btn-danger" id="btnClearCp" onclick="clearCheckpoint()"><svg class="i"><use href="#i-trash"/></svg>Clear checkpoint</button></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-hd"><div class="card-t"><svg class="i"><use href="#i-keyboard"/></svg>Keyboard shortcuts</div></div>
+            <div class="card-bd flush kv-list">
+              <div class="kv-row"><span class="k">Switch page</span><span class="v"><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> <kbd>5</kbd></span></div>
+              <div class="kv-row"><span class="k">Start run</span><span class="v"><kbd>Ctrl</kbd> <kbd>Enter</kbd> on Export or Import</span></div>
+              <div class="kv-row"><span class="k">Stop run</span><span class="v"><kbd>Esc</kbd></span></div>
+            </div>
           </div>
         </div>
-        <div>
+        <div class="col">
           <div class="card">
-            <div class="card-title">ℹ️ About</div>
-            <p style="font-size:13px;color:var(--muted);line-height:1.7">
-              <strong style="color:var(--text)">MangaDex All-in-One Exporter v2.0</strong><br><br>
-              Export your full MangaDex library to MAL and AniList XML, plus JSON backup.<br><br>
-              <strong style="color:var(--accent)">Fast mode</strong> — skips individual chapter fetching. Much faster, recommended for most users.<br><br>
-              <strong style="color:var(--accent2)">Deep mode</strong> — fetches your last read chapter per manga. Slower but includes progress data.<br><br>
-              Running locally at <code style="background:var(--surface);padding:2px 6px;border-radius:4px">http://localhost:7337</code>
-            </p>
+            <div class="card-hd"><div class="card-t"><svg class="i"><use href="#i-info"/></svg>About this install</div><span class="pill ok"><i class="dot ok"></i>Local</span></div>
+            <div class="card-bd flush kv-list">
+              <div class="kv-row"><span class="k">Version</span><span class="v" id="infoVer">-</span></div>
+              <div class="kv-row"><span class="k">Local URL</span><span class="v" id="infoUrl">-</span></div>
+              <div class="kv-row"><span class="k">Working dir</span><span class="v wrap" id="infoCwd">-</span></div>
+              <div class="kv-row"><span class="k">History file</span><span class="v wrap" id="infoHist">-</span></div>
+              <div class="kv-row"><span class="k">Checkpoint file</span><span class="v wrap" id="infoCp">-</span></div>
+              <div class="kv-row"><span class="k">Platform</span><span class="v" id="infoPlat">-</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-hd"><div class="card-t"><svg class="i"><use href="#i-bolt"/></svg>Modes explained</div></div>
+            <div class="card-bd">
+              <div class="opts one">
+                <div class="opt" style="cursor:default"><span><span class="ot">Fast</span><span class="os">Fetches statuses, titles, links and ratings in batches of 100. A few minutes even for large libraries.</span></span></div>
+                <div class="opt" style="cursor:default"><span><span class="ot">Deep</span><span class="os">Also resolves every chapter you've read to find the last chapter and volume, including chapters later removed by takedowns.</span></span></div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+    </section>
 
-  </div><!-- /content -->
-</div><!-- /main -->
+  </main>
+</div>
 
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script>
-// ── State ───────────────────────────────────────────────────────────────────
+// ── State ────────────────────────────────────────────────────────────────────
 let mode = 'fast';
-let convFiles = [];  // [{path, status}]
-let pollTimer = null;
+let impType = 'xml';
+let convFiles = [];      // [{path, status}]
+let historyRows = [];
+let histFilter = 'all';
+let lastSkipped = [];
+let wasRunning = false;
+let lastRunEndedAt = null;
+let libCounts = null;
+const autoScroll = { logBox: true, logBox2: true };
+const lineCount  = { logBox: 0, logBox2: 0 };
+const $ = id => document.getElementById(id);
 
-// ── Navigation ──────────────────────────────────────────────────────────────
-document.querySelectorAll('.nav-item').forEach(el => {
-  el.addEventListener('click', () => {
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    el.classList.add('active');
-    const pg = el.dataset.page;
-    document.getElementById('page-'+pg).classList.add('active');
-    document.getElementById('pageTitle').textContent = el.textContent.trim();
-    if (pg === 'history') loadHistory();
-    if (pg === 'settings') loadCpInfo();
-  });
-});
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+async function postJSON(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}) });
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  return d;
+}
+const icon = (id, cls) => `<svg class="i ${cls||''}" aria-hidden="true"><use href="#${id}"/></svg>`;
 
-// ── SSE Log stream ───────────────────────────────────────────────────────────
+// ── Navigation ───────────────────────────────────────────────────────────────
+function goPage(pg) {
+  const el = document.querySelector(`.nav-item[data-page="${pg}"]`);
+  if (!el) return;
+  document.querySelectorAll('.nav-item').forEach(n => { n.classList.toggle('active', n === el); n.removeAttribute('aria-current'); });
+  el.setAttribute('aria-current', 'page');
+  document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + pg));
+  $('pageTitle').textContent = el.dataset.label;
+  if (location.hash !== '#' + pg) history.replaceState(null, '', '#' + pg);
+  if (pg === 'history') loadHistory();
+  if (pg === 'settings') { loadCpInfo(); loadInfo(); }
+}
+document.querySelectorAll('.nav-item').forEach(el => el.addEventListener('click', () => goPage(el.dataset.page)));
+
+// ── Log stream ───────────────────────────────────────────────────────────────
+const TAG = { info: 'INFO', success: 'OK', warning: 'WARN', error: 'ERR' };
+function appendLog(boxId, d) {
+  const box = $(boxId);
+  const tag = d.tag || 'info';
+  const line = document.createElement('div');
+  const sect = /^\u2500\u2500\s*(.+?)\s*\u2500\u2500$/.exec(d.msg || '');
+  if (sect) {
+    line.className = 'log-sect';
+    line.innerHTML = `<span>${escHtml(sect[1])}</span>`;
+  } else {
+    // The worker prefixes messages with its own status glyph; the [TAG] already says that.
+    const msg = String(d.msg || '').replace(/^[\u2713\u2714\u26a0\u2717\u2718]\s*/, '');
+    line.className = 'log-line ' + tag;
+    line.innerHTML = `<span class="ts">${escHtml(d.ts)}</span><span class="tg">[${TAG[tag] || tag.toUpperCase()}]</span><span class="m">${escHtml(msg)}</span>`;
+  }
+  box.appendChild(line);
+  lineCount[boxId]++;
+  $(boxId + 'Count').textContent = lineCount[boxId] + (lineCount[boxId] === 1 ? ' line' : ' lines');
+  $(boxId + 'Empty').hidden = true;
+  if (autoScroll[boxId]) box.scrollTop = box.scrollHeight;
+}
+function clearLog(boxId) {
+  $(boxId).innerHTML = '';
+  lineCount[boxId] = 0;
+  $(boxId + 'Count').textContent = '0 lines';
+  $(boxId + 'Empty').hidden = false;
+}
+function toggleAuto(boxId) {
+  autoScroll[boxId] = !autoScroll[boxId];
+  const b = $(boxId + 'Auto');
+  b.textContent = autoScroll[boxId] ? 'Autoscroll on' : 'Autoscroll off';
+  b.classList.toggle('ok', autoScroll[boxId]);
+  b.setAttribute('aria-pressed', autoScroll[boxId]);
+  if (autoScroll[boxId]) $(boxId).scrollTop = $(boxId).scrollHeight;
+}
 const evtSrc = new EventSource('/api/stream');
 evtSrc.onmessage = e => {
   const d = JSON.parse(e.data);
   if (d.ping) return;
-  addLog(d.ts, d.msg, d.tag);
+  appendLog('logBox', d);
+  appendLog('logBox2', d);
 };
 
-function addLog(ts, msg, tag) {
-  const box = document.getElementById('logBox');
-  const line = document.createElement('span');
-  line.className = 'log-line';
-  line.innerHTML = `<span class="log-ts">[${ts}]</span><span class="log-${tag||'info'}">${escHtml(msg)}</span>`;
-  box.appendChild(line);
-  box.scrollTop = box.scrollHeight;
+// ── Status polling ───────────────────────────────────────────────────────────
+function setStatePills(kind, text) {
+  const cls = kind === 'run' ? 'pill accent' : kind === 'done' ? 'pill ok' : 'pill';
+  const dot = kind === 'run' ? 'dot live' : kind === 'done' ? 'dot ok' : 'dot';
+  const html = `<i class="${dot}"></i>${text}`;
+  document.querySelectorAll('[data-state-pill]').forEach(p => { p.className = cls; p.innerHTML = html; });
+  $('topState').className = cls; $('topState').innerHTML = html;
+  $('sideDot').className = dot; $('sideState').textContent = text;
 }
-
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function setProgress(prefix, pct, label, idleText) {
+  const p = Math.max(0, Math.min(100, pct || 0));
+  const fill = $(prefix + 'ProgFill') || $('progFill');
+  const pctEl = $(prefix + 'ProgPct') || $('progPct');
+  const lblEl = $(prefix + 'ProgLabel') || $('progLabel');
+  fill.style.transform = `scaleX(${p / 100})`;
+  fill.setAttribute('aria-valuenow', Math.round(p));
+  pctEl.innerHTML = `${p >= 10 ? Math.round(p) : p.toFixed(1).replace(/\.0$/, '')}<small>%</small>`;
+  pctEl.classList.toggle('idle', !label);
+  lblEl.textContent = label || idleText;
 }
+function fmtTime(d) { return d.toTimeString().slice(0, 5); }
 
-function clearLog() {
-  document.getElementById('logBox').innerHTML = '';
-}
-
-// ── Poll status ─────────────────────────────────────────────────────────────
 async function pollStatus() {
-  try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    const fill = document.getElementById('progFill');
-    const lbl  = document.getElementById('progLabel');
-    const eta  = document.getElementById('progEta');
-    const dot  = document.getElementById('globalDot');
-    const glbl = document.getElementById('globalLabel');
-    const tp   = document.getElementById('topProgress');
-    const te   = document.getElementById('topEta');
+  let d;
+  try { d = await (await fetch('/api/status')).json(); } catch (e) { return; }
+  const running = !!d.running;
 
-    fill.style.width = d.progress + '%';
-    lbl.textContent  = d.label;
-    eta.textContent  = d.eta;
-    tp.textContent   = d.progress > 0 ? Math.round(d.progress) + '%' : '—';
-    te.textContent   = d.eta;
+  if (wasRunning && !running) { lastRunEndedAt = new Date(); loadHistory(); }
+  wasRunning = running;
 
-    // Mirror progress to import page bars too
-    const impFill  = document.getElementById('impProgFill');
-    const impLabel = document.getElementById('impProgLabel');
-    if (impFill)  impFill.style.width   = d.progress + '%';
-    if (impLabel) impLabel.textContent  = d.label;
+  if (running) {
+    setStatePills('run', 'Running');
+    $('runMeter').hidden = false;
+    $('topPct').textContent = Math.round(d.progress || 0) + '%';
+    $('topFill').style.transform = `scaleX(${(d.progress || 0) / 100})`;
+    $('topEta').textContent = d.eta ? 'ETA ' + d.eta : '';
+  } else {
+    $('runMeter').hidden = true;
+    if (lastRunEndedAt) setStatePills('done', 'Finished ' + fmtTime(lastRunEndedAt));
+    else setStatePills('idle', 'Idle');
+  }
 
-    if (d.running) {
-      dot.className = 'status-dot busy';
-      glbl.textContent = 'Running…';
-      document.getElementById('btnAll').disabled = true;
-      document.getElementById('btnStop').disabled = false;
-      document.getElementById('btnResume').disabled = true;
-      document.querySelectorAll('.chip').forEach(c => c.style.pointerEvents='none');
-      const bi = document.getElementById('btnImport');
-      const bs = document.getElementById('btnImportStop');
-      if (bi) bi.disabled = true;
-      if (bs) bs.disabled = false;
-    } else {
-      dot.className = 'status-dot' + (d.progress >= 100 ? '' : ' idle');
-      glbl.textContent = d.progress >= 100 ? 'Done!' : 'Ready';
-      document.getElementById('btnAll').disabled = false;
-      document.getElementById('btnStop').disabled = true;
-      document.getElementById('btnResume').disabled = !d.has_checkpoint;
-      document.querySelectorAll('.chip').forEach(c => c.style.pointerEvents='');
-      const bi = document.getElementById('btnImport');
-      const bs = document.getElementById('btnImportStop');
-      if (bi) bi.disabled = false;
-      if (bs) bs.disabled = true;
-    }
+  const idleExp = lastRunEndedAt ? `Last run finished at ${fmtTime(lastRunEndedAt)}. Details are in the log.` : 'Nothing running. Start an export to see live progress.';
+  const idleImp = lastRunEndedAt ? `Last run finished at ${fmtTime(lastRunEndedAt)}. Details are in the log.` : 'Nothing running. Start an import to see live progress.';
+  setProgress('', running ? d.progress : 0, running ? d.label : '', idleExp);
+  setProgress('imp', running ? d.progress : 0, running ? d.label : '', idleImp);
+  $('progEta').textContent = running && d.eta ? d.eta : '-';
 
-    // Skipped manga panel (export page)
-    const skipped = d.skipped || [];
-    const card = document.getElementById('skippedCard');
-    const list = document.getElementById('skippedList');
-    const cnt  = document.getElementById('skippedCount');
-    if (skipped.length) {
-      card.style.display = '';
-      cnt.textContent = skipped.length + ' manga';
-      list.innerHTML = skipped.map(t =>
-        `<span style="background:rgba(240,96,96,.1);border:1px solid rgba(240,96,96,.3);
-         border-radius:5px;padding:3px 8px;font-size:11px;color:var(--red);
-         font-family:var(--mono);white-space:nowrap">${escHtml(t)}</span>`
-      ).join('');
-    } else {
-      card.style.display = 'none';
-    }
+  $('btnAll').disabled = running;
+  $('btnStop').disabled = !running;
+  $('btnResume').disabled = running || !d.has_checkpoint;
+  $('btnImport').disabled = running;
+  $('btnImportStop').disabled = !running;
+  $('btnCounts').disabled = running;
+  document.querySelectorAll('.st').forEach(c => c.disabled = running);
 
-    // Skipped panel on import page
-    const impCard = document.getElementById('impSkippedCard');
-    const impList = document.getElementById('impSkippedList');
-    const impCnt  = document.getElementById('impSkippedCount');
-    if (skipped.length && impCard) {
-      impCard.style.display = '';
-      impCnt.textContent = skipped.length + ' skipped';
-      impList.innerHTML = skipped.map(t =>
-        `<span style="background:rgba(240,96,96,.1);border:1px solid rgba(240,96,96,.3);
-         border-radius:5px;padding:3px 8px;font-size:11px;color:var(--red);
-         font-family:var(--mono);white-space:nowrap">${escHtml(t)}</span>`
-      ).join('');
-    } else if (impCard) {
-      impCard.style.display = 'none';
-    }
-  } catch(e) {}
+  const cpText = d.has_checkpoint ? ((d.checkpoint_done || []).length ? 'Saved: ' + d.checkpoint_done.join(', ') : 'Saved') : 'None';
+  $('sideCp').textContent = d.has_checkpoint ? 'Saved' : 'None';
+  document.querySelectorAll('[data-cp-text]').forEach(el => el.textContent = cpText);
+
+  const skipped = d.skipped || [];
+  if (skipped.join('\u0001') !== lastSkipped.join('\u0001')) {
+    lastSkipped = skipped.slice();
+    renderSkipRows('skippedList', skipped);
+    renderSkipRows('impSkippedList', skipped);
+    const label = skipped.length + (skipped.length === 1 ? ' title' : ' titles');
+    $('skippedCount').textContent = label;
+    $('impSkippedCount').textContent = label;
+  }
+  $('skippedCard').hidden = !skipped.length;
+  $('impSkippedCard').hidden = !skipped.length;
 }
 setInterval(pollStatus, 800);
-pollStatus();
 
-// ── Mode ─────────────────────────────────────────────────────────────────────
+function renderSkipRows(listId, titles) {
+  $(listId).innerHTML = titles.map((t, i) => `
+    <div class="row">
+      <span class="idx">${String(i + 1).padStart(2, '0')}</span>
+      <span class="ttl" title="${escHtml(t)}">${escHtml(t)}</span>
+      <span class="acts">
+        <button class="btn btn-sm btn-ghost" data-t="${escHtml(t)}" onclick="searchMal(this.dataset.t)">${icon('i-external')}Search MAL</button>
+        <button class="btn btn-sm btn-ghost" data-t="${escHtml(t)}" onclick="copyText(this.dataset.t)" aria-label="Copy title">${icon('i-copy')}</button>
+      </span>
+    </div>`).join('');
+}
+async function searchMal(title) {
+  const url = 'https://myanimelist.net/manga.php?cat=manga&q=' + encodeURIComponent(title);
+  const d = await postJSON('/api/open_url', { url });
+  if (!d.ok) toast('Could not open the browser.', 'err');
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+    ta.select(); try { document.execCommand('copy'); } catch (e2) {} ta.remove();
+  }
+  toast('Copied to clipboard.', 'ok');
+}
+function copyList(list) { if (list.length) copyText(list.join('\n')); }
+
+// ── Mode / head meta ─────────────────────────────────────────────────────────
 function setMode(m) {
   mode = m;
-  document.querySelectorAll('.mode-btn[data-mode]').forEach(b => {
-    b.classList.toggle('active', b.dataset.mode === m);
-  });
+  document.querySelectorAll('.seg-opt[data-mode]').forEach(b => { const on = b.dataset.mode === m; b.classList.toggle('active', on); b.setAttribute('aria-checked', on); });
+  document.querySelectorAll('.seg-opt[data-smode]').forEach(b => { const on = b.dataset.smode === m; b.classList.toggle('active', on); b.setAttribute('aria-checked', on); });
+  const label = m === 'deep' ? 'Deep' : 'Fast';
+  $('headMode').innerHTML = `Mode <span class="val">${label}</span>`;
+  $('paramMode').innerHTML = `Profile <span class="val">${label}</span>`;
+  $('progMode').textContent = label;
+  $('setModePill').textContent = label;
 }
-function setSettingsMode(m) {
-  setMode(m);
-  document.querySelectorAll('.mode-btn[data-smode]').forEach(b => {
-    b.classList.toggle('active', b.dataset.smode === m);
-  });
+function setSettingsMode(m) { setMode(m); }
+function refreshHeadMeta() {
+  const n = ['fmtMal', 'fmtAl', 'fmtJson'].filter(id => $(id).checked).length + 1;  // +1: XLSX always written
+  $('headFormats').innerHTML = `Formats <span class="val">${n}</span>`;
 }
 
 // ── Credentials ──────────────────────────────────────────────────────────────
 function creds() {
   return {
-    client_id:     document.getElementById('clientId').value.trim(),
-    client_secret: document.getElementById('clientSecret').value.trim(),
-    username:      document.getElementById('username').value.trim(),
-    password:      document.getElementById('password').value.trim(),
-    mal_user_id:   document.getElementById('malUserId').value.trim(),
-    mal_username:  document.getElementById('malUsername').value.trim(),
-    save_dir:      document.getElementById('saveDir').value.trim(),
-    mode:          mode,
-    fmt_mal:       document.getElementById('fmtMal').checked,
-    fmt_al:        document.getElementById('fmtAl').checked,
-    fmt_json:      document.getElementById('fmtJson').checked,
-    dry_run:       document.getElementById('dryRun').checked,
+    client_id: $('clientId').value.trim(), client_secret: $('clientSecret').value.trim(),
+    username: $('username').value.trim(), password: $('password').value.trim(),
+    mal_user_id: $('malUserId').value.trim(), mal_username: $('malUsername').value.trim(),
+    save_dir: $('saveDir').value.trim(), mode: mode,
+    fmt_mal: $('fmtMal').checked, fmt_al: $('fmtAl').checked, fmt_json: $('fmtJson').checked,
+    dry_run: $('dryRun').checked,
   };
 }
-
-async function testCreds() {
-  const c = creds();
-  if (!c.client_id || !c.client_secret || !c.username || !c.password) {
-    toast('Fill in all credential fields first.', 'err'); return;
+function impCreds() {
+  return { client_id: $('impClientId').value.trim(), client_secret: $('impClientSecret').value.trim(),
+           username: $('impUsername').value.trim(), password: $('impPassword').value.trim() };
+}
+function haveAll(c) { return c.client_id && c.client_secret && c.username && c.password; }
+function setAuth(grp, state, note) {
+  const pill = $(grp + 'AuthPill'), n = $(grp + 'AuthNote');
+  pill.className = 'pill' + (state === 'ok' ? ' ok' : state === 'err' ? ' err' : state === 'busy' ? ' accent' : '');
+  pill.innerHTML = state === 'ok' ? `<i class="dot ok"></i>Verified` : state === 'err' ? 'Rejected' : state === 'busy' ? '<i class="dot live"></i>Checking' : 'Unverified';
+  n.textContent = note || '';
+}
+async function verifyCreds(grp) {
+  const c = grp === 'exp' ? creds() : impCreds();
+  if (!haveAll(c)) { toast('Fill in all four credential fields first.', 'err'); return; }
+  const btn = $(grp === 'exp' ? 'btnVerifyExp' : 'btnVerifyImp');
+  btn.disabled = true; setAuth(grp, 'busy');
+  const d = await postJSON('/api/test_credentials', c);
+  btn.disabled = false;
+  if (d.ok) {
+    const mins = Math.max(1, Math.round((d.expires_in || 0) / 60));
+    setAuth(grp, 'ok', `token ${mins}m`);
+    toast('Credentials verified with MangaDex.', 'ok');
+  } else {
+    setAuth(grp, 'err');
+    toast(d.error || 'Verification failed.', 'err');
   }
-  toast('Testing…', 'warn');
-  const r = await fetch('/api/export', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({...c, dry_run: true, status: 'reading', _test_only: true})
-  });
-  // Just start a dry run of reading status as a credential test
-  toast('Credentials test started — check the log!', 'ok');
+}
+document.querySelectorAll('input.cred').forEach(inp => inp.addEventListener('input', () => setAuth(inp.dataset.grp, 'none')));
+function toggleVis(id, btn) {
+  const inp = $(id), show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  btn.innerHTML = icon(show ? 'i-eye-off' : 'i-eye');
+  btn.setAttribute('aria-label', (show ? 'Hide ' : 'Show ') + (btn.getAttribute('aria-label') || '').replace(/^(Show|Hide) /, ''));
+}
+function copyCredsFromExport() {
+  const c = creds();
+  if (!c.client_id && !c.username) { toast('No credentials on the Export tab yet.', 'warn'); return; }
+  $('impClientId').value = c.client_id; $('impClientSecret').value = c.client_secret;
+  $('impUsername').value = c.username;  $('impPassword').value = c.password;
+  const expOk = $('expAuthPill').classList.contains('ok');
+  setAuth('imp', expOk ? 'ok' : 'none', expOk ? $('expAuthNote').textContent : '');
+  toast('Copied credentials from Export.', 'ok');
+}
+function copyMalFromExport() {
+  if (!$('malUserId').value && !$('malUsername').value) { toast('No MAL profile on the Export tab yet.', 'warn'); return; }
+  $('convMalId').value = $('malUserId').value; $('convMalName').value = $('malUsername').value;
+  toast('Copied MAL profile from Export.', 'ok');
 }
 
 // ── Export ───────────────────────────────────────────────────────────────────
+async function refreshCounts() {
+  const c = creds();
+  if (!haveAll(c)) { toast('Fill in all four credential fields first.', 'err'); return; }
+  const btn = $('btnCounts'); btn.disabled = true; $('countsHint').textContent = 'Loading from MangaDex...';
+  const d = await postJSON('/api/library_counts', c);
+  btn.disabled = false;
+  if (!d.ok) { $('countsHint').textContent = 'Counts load from your library'; toast(d.error || 'Could not load counts.', 'err'); return; }
+  libCounts = d.counts;
+  for (const [s, n] of Object.entries(d.counts)) { const el = $('count-' + s); if (el) el.textContent = n.toLocaleString(); }
+  $('libTotal').hidden = false; $('libTotalN').textContent = d.total.toLocaleString();
+  $('btnAllCount').textContent = `(${d.total.toLocaleString()})`;
+  $('countsHint').textContent = 'Live from MangaDex';
+  setAuth('exp', 'ok', $('expAuthNote').textContent || '');
+  toast(`${d.total.toLocaleString()} titles in your library.`, 'ok');
+}
 async function startExport(status) {
   const c = creds();
-  if (!c.client_id || !c.username) { toast('Fill in credentials first.', 'err'); return; }
+  if (!haveAll(c)) { toast('Fill in all four credential fields first.', 'err'); return; }
   if (status) c.status = status;
-  const r = await fetch('/api/export', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(c)
-  });
-  const d = await r.json();
-  if (!d.ok) { toast(d.error || 'Error', 'err'); return; }
-  toast('Export started!', 'ok');
+  const d = await postJSON('/api/export', c);
+  if (!d.ok) { toast(d.error || 'Could not start the export.', 'err'); return; }
+  lastRunEndedAt = null;
+  toast(status ? `Exporting ${status.replace(/_/g, ' ')}.` : 'Export started.', 'ok');
+  pollStatus();
 }
-
 async function resumeExport() {
   const c = creds();
-  if (!c.client_id || !c.username) { toast('Fill in credentials first.', 'err'); return; }
-  const r = await fetch('/api/resume', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(c)
-  });
-  const d = await r.json();
-  if (!d.ok) { toast(d.error || 'Error', 'err'); return; }
-  toast('Resuming from checkpoint…', 'ok');
+  if (!haveAll(c)) { toast('Fill in all four credential fields first.', 'err'); return; }
+  const d = await postJSON('/api/resume', c);
+  if (!d.ok) { toast(d.error || 'Could not resume.', 'err'); return; }
+  lastRunEndedAt = null;
+  toast('Resuming from checkpoint.', 'ok');
 }
-
-async function stopExport() {
-  await fetch('/api/stop', {method:'POST'});
-  toast('Stop requested…', 'warn');
+async function stopRun() {
+  await postJSON('/api/stop');
+  toast('Stop requested. The run halts after the current batch.', 'warn');
 }
 
 // ── Convert ──────────────────────────────────────────────────────────────────
-function addFile() {
-  const path = prompt('Paste the full path to your .xlsx file:');
-  if (!path) return;
-  const status = guessStatus(path);
-  convFiles.push({path, status});
-  renderFileList();
-}
-
-async function autoFill() {
-  const r = await fetch('/api/exported_files');
-  const files = await r.json();
-  if (!files.length) { toast('No recently exported files found. Export first.', 'warn'); return; }
-  files.forEach(path => {
-    if (!convFiles.find(f => f.path === path)) {
-      convFiles.push({path, status: guessStatus(path)});
-    }
-  });
-  renderFileList();
-  toast(`${files.length} file(s) added!`, 'ok');
-  // also fill save dir
-  if (files.length) {
-    document.getElementById('convSaveDir').value = files[0].replace(/[/\\][^/\\]+$/, '');
-  }
-}
-
-function clearFiles() { convFiles = []; renderFileList(); }
-
 function guessStatus(path) {
   const n = path.toLowerCase();
   if (n.includes('re_reading') || n.includes('re-reading')) return 'Reading';
-  if (n.includes('reading'))      return 'Reading';
-  if (n.includes('completed'))    return 'Completed';
-  if (n.includes('on_hold'))      return 'On-Hold';
-  if (n.includes('dropped'))      return 'Dropped';
-  if (n.includes('plan'))         return 'Plan to Read';
+  if (n.includes('reading'))   return 'Reading';
+  if (n.includes('completed')) return 'Completed';
+  if (n.includes('on_hold'))   return 'On-Hold';
+  if (n.includes('dropped'))   return 'Dropped';
+  if (n.includes('plan'))      return 'Plan to Read';
   return 'Reading';
 }
-
+function addFile() {
+  const path = prompt('Full path to an exported .xlsx file:');
+  if (!path) return;
+  convFiles.push({ path: path.trim(), status: guessStatus(path) });
+  renderFileList();
+}
+async function autoFill() {
+  const files = await (await fetch('/api/exported_files')).json();
+  if (!files.length) { toast('No exports from this session yet. Run an export first.', 'warn'); return; }
+  let added = 0;
+  files.forEach(path => { if (!convFiles.find(f => f.path === path)) { convFiles.push({ path, status: guessStatus(path) }); added++; } });
+  renderFileList();
+  if (!$('convSaveDir').value) $('convSaveDir').value = files[0].replace(/[/\\][^/\\]+$/, '');
+  toast(`${added} file${added === 1 ? '' : 's'} added.`, 'ok');
+}
+function clearFiles() { convFiles = []; renderFileList(); }
+function removeFile(i) { convFiles.splice(i, 1); renderFileList(); }
 function renderFileList() {
-  const el = document.getElementById('fileList');
+  const el = $('fileList');
+  $('convFilesPill').innerHTML = `Files <span class="val">${convFiles.length}</span>`;
   if (!convFiles.length) {
-    el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:10px 0">No files added yet. Click + Add or ⟳ Auto-fill.</div>';
+    el.innerHTML = `<div class="empty">${icon('i-sheet')}<span class="t">No files queued</span>
+      <span class="s">Auto-fill picks up the .xlsx files from this session's export. Status is detected from each filename.</span>
+      <div class="action-row"><button class="btn btn-sm" onclick="autoFill()">${icon('i-refresh')}Auto-fill</button><button class="btn btn-sm btn-ghost" onclick="addFile()">${icon('i-plus')}Add path</button></div></div>`;
     return;
   }
-  el.innerHTML = convFiles.map((f, i) => `
-    <div class="file-item">
-      <span class="nav-icon">📄</span>
-      <span class="file-name">${f.path.split(/[/\\]/).pop()}</span>
-      <select class="file-status-select" onchange="convFiles[${i}].status=this.value">
-        ${['Reading','Completed','On-Hold','Dropped','Plan to Read'].map(s =>
-          `<option ${s===f.status?'selected':''}>${s}</option>`).join('')}
-      </select>
-      <button class="btn btn-xs btn-danger" onclick="convFiles.splice(${i},1);renderFileList()">✕</button>
-    </div>`).join('');
+  const opts = ['Reading', 'Completed', 'On-Hold', 'Dropped', 'Plan to Read'];
+  el.innerHTML = convFiles.map((f, i) => {
+    const name = f.path.split(/[/\\]/).pop();
+    return `<div class="row">${icon('i-sheet', 'lead')}
+      <span class="ttl mono" title="${escHtml(f.path)}">${escHtml(name)}</span>
+      <select aria-label="Status for ${escHtml(name)}" onchange="convFiles[${i}].status=this.value">${opts.map(s => `<option ${s === f.status ? 'selected' : ''}>${s}</option>`).join('')}</select>
+      <button class="btn btn-sm btn-ghost" onclick="removeFile(${i})" aria-label="Remove ${escHtml(name)}">${icon('i-x')}</button></div>`;
+  }).join('');
+}
+async function generateXml() {
+  if (!convFiles.length) { toast('Add at least one .xlsx file first.', 'err'); return; }
+  const uid = $('convMalId').value.trim(), uname = $('convMalName').value.trim();
+  if (!uid || !uname) { toast('MAL user ID and username are required for Convert.', 'err'); return; }
+  const btn = $('btnGenerate'); btn.disabled = true;
+  $('convState').className = 'pill accent'; $('convState').innerHTML = '<i class="dot live"></i>Working';
+  const d = await postJSON('/api/convert', {
+    mal_user_id: uid, mal_username: uname, save_dir: $('convSaveDir').value.trim(),
+    fmt_mal: $('convMal').checked, fmt_al: $('convAl').checked,
+    include_scores: $('convScores').checked, dry_run: $('convDry').checked, files: convFiles,
+  });
+  btn.disabled = false;
+  const res = $('convResult'); res.hidden = false;
+  if (!d.ok) {
+    $('convState').className = 'pill err'; $('convState').textContent = 'Failed';
+    res.innerHTML = `<div class="callout err">${icon('i-warning')}<span><span class="ct">Convert failed</span><span class="cs">${escHtml(d.error || 'Unknown error')}</span></span></div>`;
+    return;
+  }
+  const n = d.total.toLocaleString();
+  if (d.dry) {
+    $('convState').className = 'pill warn'; $('convState').textContent = 'Dry run';
+    res.innerHTML = `<div class="callout warn">${icon('i-info')}<span><span class="ct">Dry run</span><span class="cs">${n} titles would be written. ${d.skipped} would be skipped.</span></span></div>`;
+  } else {
+    $('convState').className = 'pill ok'; $('convState').innerHTML = '<i class="dot ok"></i>Done';
+    const files = (d.files || []).map(f => `<br><span class="sub-note">${escHtml(f)}</span>`).join('');
+    res.innerHTML = `<div class="callout ok">${icon('i-check-circle')}<span><span class="ct">${n} titles written</span><span class="cs">${d.skipped} skipped for missing MAL IDs.${files}</span></span></div>`;
+  }
+  const sk = d.skipped_titles || [];
+  $('convSkipPill').className = sk.length ? 'pill warn' : 'pill ok';
+  $('convSkipPill').textContent = sk.length ? `${d.skipped} titles` : 'None skipped';
+  if (sk.length) renderSkipRows('skippedBox', sk);
+  else $('skippedBox').innerHTML = `<div class="empty">${icon('i-check-circle')}<span class="t">Nothing skipped</span><span class="s">Every title in these files has a MAL ID.</span></div>`;
+}
+function renderConvSkipEmpty() {
+  $('skippedBox').innerHTML = `<div class="empty">${icon('i-warning')}<span class="t">No results yet</span><span class="s">Titles without a MAL link are listed here after you generate, with a quick MAL search for each.</span></div>`;
 }
 
-async function generateXml() {
-  if (!convFiles.length) { toast('Add files first.', 'err'); return; }
-  const uid = document.getElementById('convMalId').value.trim();
-  const uname = document.getElementById('convMalName').value.trim();
-  if (!uid || !uname) { toast('MAL User ID and Username required.', 'err'); return; }
-
-  const payload = {
-    mal_user_id: uid, mal_username: uname,
-    save_dir:    document.getElementById('convSaveDir').value.trim(),
-    fmt_mal:     document.getElementById('convMal').checked,
-    fmt_al:      document.getElementById('convAl').checked,
-    include_scores: document.getElementById('convScores').checked,
-    dry_run:     document.getElementById('convDry').checked,
-    files:       convFiles,
-  };
-
-  const r = await fetch('/api/convert', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const d = await r.json();
-
-  const res = document.getElementById('convResult');
-  const sk  = document.getElementById('skippedBox');
-
-  if (!d.ok) { toast(d.error || 'Error', 'err'); return; }
-
-  if (d.dry) {
-    res.innerHTML = `<span style="color:var(--yellow)">🔍 Dry Run: ${d.total} manga would be exported, ${d.skipped} skipped.</span>`;
-    toast('Dry run complete!', 'warn');
-  } else {
-    res.innerHTML = `<span style="color:var(--green)">✓ ${d.total} manga exported. ${d.skipped} skipped.</span>`;
-    toast(`Done! ${d.total} manga → ${d.files?.length} file(s)`, 'ok');
-  }
-
-  if (d.skipped_titles?.length) {
-    sk.textContent = `${d.skipped} skipped:\n` + d.skipped_titles.join(', ');
-  } else {
-    sk.textContent = '✓ All manga had MAL IDs!';
-    sk.style.color = 'var(--green)';
-  }
+// ── Import ───────────────────────────────────────────────────────────────────
+function setImpType(t) {
+  impType = t;
+  document.querySelectorAll('.seg-opt[data-imptype]').forEach(b => { const on = b.dataset.imptype === t; b.classList.toggle('active', on); b.setAttribute('aria-checked', on); });
+  $('impXmlNote').hidden = t !== 'xml';
+  $('impJsonNote').hidden = t !== 'json';
+  $('impTypePill').innerHTML = `Source <span class="val">${t === 'xml' ? 'XML' : 'JSON'}</span>`;
+  $('impFilePath').placeholder = t === 'xml' ? '/path/to/mal_reading.xml' : '/path/to/mdex_reading.json';
+}
+async function startImport() {
+  const c = impCreds(), fp = $('impFilePath').value.trim();
+  if (!haveAll(c)) { toast('Fill in all four credential fields first.', 'err'); return; }
+  if (!fp) { toast('Choose a file to import.', 'err'); return; }
+  const d = await postJSON('/api/import', { ...c, file_path: fp, file_type: impType,
+    import_scores: $('impScores').checked, dry_run: $('impDry').checked });
+  if (!d.ok) { toast(d.error || 'Could not start the import.', 'err'); return; }
+  lastRunEndedAt = null;
+  toast('Import started.', 'ok');
+  pollStatus();
 }
 
 // ── History ──────────────────────────────────────────────────────────────────
-async function loadHistory() {
-  const r = await fetch('/api/history');
-  const rows = await r.json();
-  const tbody = document.getElementById('historyBody');
-  if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);text-align:center;padding:30px">No history yet</td></tr>';
-    return;
-  }
-  tbody.innerHTML = rows.map(e => `<tr>
-    <td style="font-family:var(--mono);font-size:11px">${e.date||''}</td>
-    <td>${e.type||''}</td>
-    <td style="color:var(--green)">${e.total||''}</td>
-    <td style="color:var(--red)">${e.skipped||0}</td>
-    <td><span style="background:var(--surface);padding:2px 8px;border-radius:4px;font-size:11px">${e.mode||''}</span></td>
-    <td style="color:var(--muted)">${e.elapsed||''}</td>
-    <td style="font-family:var(--mono);font-size:10px;color:var(--muted)">${(e.files||'').substring(0,60)}${(e.files||'').length>60?'…':''}</td>
-  </tr>`).join('');
+function opOf(e) {
+  const t = (e.type || '').toLowerCase();
+  if (t.startsWith('import')) return 'import';
+  if (t === 'convert') return 'convert';
+  return 'export';
 }
+const STATUS_LABEL = { reading: 'Reading', completed: 'Completed', on_hold: 'On-hold', dropped: 'Dropped',
+                       plan_to_read: 'Plan to read', re_reading: 'Re-reading', 'full library': 'Full library' };
+function fmtDur(v) {
+  const n = parseInt(v);
+  if (!n) return '-';
+  return n >= 60 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${n}s`;
+}
+const OP_META = { export: ['accent', 'i-upload', 'Export'], import: ['info', 'i-download', 'Import'], convert: ['ok', 'i-convert', 'Convert'] };
+async function loadHistory() {
+  try { historyRows = await (await fetch('/api/history')).json(); } catch (e) { historyRows = []; }
+  const runs = historyRows.length;
+  const titles = historyRows.reduce((a, e) => a + (Number(e.total) || 0), 0);
+  const skipped = historyRows.reduce((a, e) => a + (Number(e.skipped) || 0), 0);
+  const timed = historyRows.map(e => parseInt(e.elapsed)).filter(n => n > 0);
+  const avg = timed.length ? Math.round(timed.reduce((a, b) => a + b, 0) / timed.length) : 0;
+  const counts = { export: 0, import: 0, convert: 0 };
+  historyRows.forEach(e => counts[opOf(e)]++);
 
+  $('statRuns').textContent = runs.toLocaleString();
+  $('statRunsSub').textContent = runs ? `${counts.export} export, ${counts.import} import, ${counts.convert} convert` : 'No runs yet';
+  $('statTitles').textContent = titles.toLocaleString();
+  $('statTitlesSub').textContent = skipped ? `${skipped.toLocaleString()} skipped along the way` : 'Across all runs';
+  $('statElapsed').innerHTML = avg ? (avg >= 60 ? `${Math.floor(avg / 60)}<small>m</small>&nbsp;${avg % 60}<small>s</small>` : `${avg}<small>s</small>`) : '-';
+  $('statElapsedSub').textContent = timed.length ? `Across ${timed.length} timed runs` : 'Export and import runs';
+  $('statRate').innerHTML = titles + skipped ? `${(titles / (titles + skipped) * 100).toFixed(1)}<small>%</small>` : '-';
+  $('statRateSub').textContent = titles + skipped ? `${titles.toLocaleString()} of ${(titles + skipped).toLocaleString()} matched` : 'Titles not skipped';
+  $('hn-all').textContent = runs;
+  ['export', 'import', 'convert'].forEach(k => $('hn-' + k).textContent = counts[k]);
+
+  $('sideLast').textContent = historyRows[0] ? historyRows[0].date.slice(5, 16) : 'Never';
+  renderHistory();
+}
+function setHistFilter(f) {
+  histFilter = f;
+  document.querySelectorAll('#histTabs .tab').forEach(t => t.classList.toggle('active', t.dataset.f === f));
+  renderHistory();
+}
+function renderHistory() {
+  const q = $('historySearch').value.trim().toLowerCase();
+  const rows = historyRows.filter(e => (histFilter === 'all' || opOf(e) === histFilter) &&
+    (!q || [e.date, e.type, e.mode, e.files].some(v => String(v || '').toLowerCase().includes(q))));
+  $('historyBody').innerHTML = rows.map(e => {
+    const [cls, ic, label] = OP_META[opOf(e)];
+    const raw = e.type || '';
+    const scope = opOf(e) === 'import' ? raw.replace(/^Import\s*/i, '').replace(/[()]/g, '') || '-'
+                : opOf(e) === 'convert' ? 'XLSX' : (STATUS_LABEL[raw.toLowerCase()] || raw || '-');
+    const sk = Number(e.skipped) || 0;
+    return `<tr>
+      <td class="num" style="font-family:var(--mono);font-size:12px">${escHtml(e.date || '')}</td>
+      <td><span class="pill ${cls}">${icon(ic)}${label}</span></td>
+      <td>${escHtml(scope)}</td>
+      <td class="r num" style="font-family:var(--mono)">${(Number(e.total) || 0).toLocaleString()}</td>
+      <td class="r" style="font-family:var(--mono);color:${sk ? 'var(--warn)' : 'var(--faint)'}">${sk}</td>
+      <td><span class="pill">${escHtml(e.mode || '-')}</span></td>
+      <td class="r" style="font-family:var(--mono)">${fmtDur(e.elapsed)}</td>
+      <td class="files" title="${escHtml(e.files || '')}">${escHtml(e.files || '-')}</td></tr>`;
+  }).join('');
+  const none = !rows.length;
+  $('historyEmpty').hidden = !none;
+  $('historyEmptyT').textContent = historyRows.length ? 'No matching runs' : 'No runs yet';
+  $('historyEmptyS').textContent = historyRows.length ? 'Try a different filter or clear the search.' : 'Your first export, import or convert shows up here with totals, timing and output files.';
+  $('histFoot').textContent = `Showing ${rows.length} of ${historyRows.length} runs`;
+}
 async function clearHistory() {
-  if (!confirm('Clear all export history?')) return;
-  await fetch('/api/history/clear', {method:'POST'});
+  if (!confirm('Clear all run history? This deletes mdex_history.json.')) return;
+  await postJSON('/api/history/clear');
   toast('History cleared.', 'ok');
   loadHistory();
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
-async function clearCheckpoint() {
-  await fetch('/api/checkpoint/clear', {method:'POST'});
-  toast('Checkpoint cleared.', 'ok');
-  loadCpInfo();
-}
-
 async function loadCpInfo() {
-  const r = await fetch('/api/checkpoint');
-  const d = await r.json();
-  const el = document.getElementById('cpInfo');
-  if (d.timestamp) {
-    el.innerHTML = `Checkpoint found from <strong>${d.timestamp}</strong>. Completed: ${(d.completed||[]).join(', ') || 'none'}`;
-  } else {
-    el.innerHTML = 'No checkpoint on disk.';
-  }
+  const d = await (await fetch('/api/checkpoint')).json();
+  const has = !!d.timestamp;
+  $('cpPill').className = has ? 'pill warn' : 'pill';
+  $('cpPill').textContent = has ? 'Saved' : 'None';
+  $('btnClearCp').disabled = !has;
+  $('cpInfo').innerHTML = has
+    ? `Saved <span class="num" style="color:var(--text)">${escHtml(d.timestamp.replace('T', ' ').slice(0, 19))}</span>. Finished groups: ${escHtml((d.completed || []).join(', ') || 'none yet')}.`
+    : 'No checkpoint on disk. Exports start from the beginning.';
+}
+async function clearCheckpoint() {
+  await postJSON('/api/checkpoint/clear');
+  toast('Checkpoint cleared.', 'ok');
+  loadCpInfo(); pollStatus();
+}
+async function loadInfo() {
+  try {
+    const d = await (await fetch('/api/info')).json();
+    $('infoVer').textContent = 'v' + d.version;
+    $('infoUrl').textContent = location.origin;
+    $('infoCwd').textContent = d.cwd;
+    $('infoHist').textContent = d.history_file;
+    $('infoCp').textContent = d.checkpoint_file;
+    $('infoPlat').textContent = `${d.platform}, Python ${d.python}`;
+    $('brandVer').textContent = 'v' + d.version;
+  } catch (e) {}
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 async function paste(id) {
   try {
-    // Use server-side clipboard read to avoid pywebview/browser permission issues
-    const r = await fetch('/api/clipboard');
-    const d = await r.json();
-    if (d.ok && d.text) {
-      document.getElementById(id).value = d.text;
-    } else {
-      // Fallback to browser clipboard API if server-side fails
-      try {
-        const text = await navigator.clipboard.readText();
-        document.getElementById(id).value = text;
-      } catch(e2) { toast('Clipboard access denied — paste manually.', 'warn'); }
-    }
-  } catch(e) { toast('Clipboard access denied — paste manually.', 'warn'); }
+    const d = await (await fetch('/api/clipboard')).json();
+    if (d.ok && d.text) { $(id).value = d.text; $(id).dispatchEvent(new Event('input')); return; }
+  } catch (e) {}
+  try { $(id).value = await navigator.clipboard.readText(); $(id).dispatchEvent(new Event('input')); }
+  catch (e2) { toast('Clipboard is empty or blocked. Paste manually.', 'warn'); }
 }
-
 async function browseFolder(inputId) {
   try {
-    const r = await fetch('/api/browse_folder');
-    const d = await r.json();
-    if (d.ok && d.path) {
-      document.getElementById(inputId).value = d.path;
-      toast('Folder selected!', 'ok');
-    }
-  } catch(e) { toast('Could not open folder picker.', 'err'); }
+    const d = await (await fetch('/api/browse_folder')).json();
+    if (d.ok && d.path) { $(inputId).value = d.path; toast('Folder selected.', 'ok'); }
+  } catch (e) { toast('Could not open the folder picker.', 'err'); }
 }
-
 async function browseFile(inputId) {
   try {
-    const r = await fetch('/api/browse_file');
-    const d = await r.json();
+    const d = await (await fetch('/api/browse_file')).json();
     if (d.ok && d.path) {
-      document.getElementById(inputId).value = d.path;
-      toast('File selected!', 'ok');
+      $(inputId).value = d.path;
+      if (/\.json$/i.test(d.path)) setImpType('json'); else if (/\.xml$/i.test(d.path)) setImpType('xml');
+      toast('File selected.', 'ok');
     }
-  } catch(e) { toast('Could not open file picker.', 'err'); }
+  } catch (e) { toast('Could not open the file picker.', 'err'); }
 }
-
 let toastTimer = null;
-function toast(msg, type='ok') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = `show ${type}`;
+const TOAST_ICON = { ok: 'i-check-circle', err: 'i-x', warn: 'i-warning' };
+function toast(msg, type = 'ok') {
+  const el = $('toast');
+  el.innerHTML = icon(TOAST_ICON[type] || TOAST_ICON.ok) + `<span>${escHtml(msg)}</span>`;
+  el.className = 'show ' + type;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
 }
 
-// ── Import ───────────────────────────────────────────────────────────────────
-let impType = 'xml';
-
-function setImpType(t) {
-  impType = t;
-  document.querySelectorAll('.mode-btn[data-imptype]').forEach(b => {
-    b.classList.toggle('active', b.dataset.imptype === t);
-  });
-  document.getElementById('impXmlNote').style.display  = t === 'xml'  ? '' : 'none';
-  document.getElementById('impJsonNote').style.display = t === 'json' ? '' : 'none';
-}
-
-async function startImport() {
-  const cid  = document.getElementById('impClientId').value.trim();
-  const csec = document.getElementById('impClientSecret').value.trim();
-  const user = document.getElementById('impUsername').value.trim();
-  const pwd  = document.getElementById('impPassword').value.trim();
-  const fp   = document.getElementById('impFilePath').value.trim();
-
-  if (!cid || !csec || !user || !pwd) { toast('Fill in all credentials.', 'err'); return; }
-  if (!fp) { toast('Provide a file path.', 'err'); return; }
-
-  const payload = {
-    client_id: cid, client_secret: csec,
-    username: user, password: pwd,
-    file_path: fp, file_type: impType,
-    import_scores: document.getElementById('impScores').checked,
-    dry_run: document.getElementById('impDry').checked,
-  };
-
-  const r = await fetch('/api/import', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
-  const d = await r.json();
-  if (!d.ok) { toast(d.error || 'Error', 'err'); return; }
-  toast('Import started!', 'ok');
-}
-
-// Mirror SSE log to the import log box too
-evtSrc.addEventListener('message', e => {
-  const d = JSON.parse(e.data);
-  if (d.ping) return;
-  const box2 = document.getElementById('logBox2');
-  if (!box2) return;
-  const line = document.createElement('span');
-  line.className = 'log-line';
-  line.innerHTML = `<span class="log-ts">[${d.ts}]</span><span class="log-${d.tag||'info'}">${escHtml(d.msg)}</span>`;
-  box2.appendChild(line);
-  box2.scrollTop = box2.scrollHeight;
+// ── Keyboard ─────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
+  const page = document.querySelector('.page.active').id;
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if (page === 'page-export' && !$('btnAll').disabled) { e.preventDefault(); startExport(null); }
+    if (page === 'page-import' && !$('btnImport').disabled) { e.preventDefault(); startImport(); }
+    return;
+  }
+  if (e.key === 'Escape' && !$('btnStop').disabled) { e.preventDefault(); stopRun(); return; }
+  if (!typing && !e.ctrlKey && !e.metaKey && !e.altKey && /^[1-5]$/.test(e.key)) {
+    goPage(['export', 'convert', 'import', 'history', 'settings'][Number(e.key) - 1]);
+  }
 });
 
 // ── Init ─────────────────────────────────────────────────────────────────────
+if (location.hash.length > 1) goPage(location.hash.slice(1));
+window.addEventListener('hashchange', () => goPage(location.hash.slice(1)));
 renderFileList();
+renderConvSkipEmpty();
+refreshHeadMeta();
 loadHistory();
+loadInfo();
+pollStatus();
 </script>
 </body>
 </html>"""

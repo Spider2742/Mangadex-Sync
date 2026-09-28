@@ -73,7 +73,7 @@ This opens a native desktop window. You can also open `http://localhost:7337` in
    - **Username** and **Password** (your MangaDex login)
    - **Save folder** — where to save the output files
 3. Choose **Fast** or **Deep** mode (Fast is recommended)
-4. Click **⚡ Extract Entire Library**
+4. Click **Extract entire library** (or press `Ctrl+Enter`)
 
 > **MAL User ID and MAL Username are optional.** You do not need to fill them in to generate a working XML file. MAL identifies you by your login session when you upload — the ID and username fields in the XML header are just metadata and are ignored during import. Leave them blank if you don't know them.
 
@@ -81,7 +81,7 @@ This opens a native desktop window. You can also open `http://localhost:7337` in
 
 After export finishes, the **Convert** tab auto-fills with your exported files. Just:
 
-1. Click **⚡ Generate XML Files**
+1. Click **Generate import files**
 2. Files are saved to your chosen folder
 
 ### 4. Import to MAL / AniList
@@ -98,7 +98,7 @@ Use the **Import** tab to restore your library from:
 
 1. Browse or paste the path to your file
 2. Optionally enable **Import Scores** to restore your ratings
-3. Click **Start Import**
+3. Click **Start import**
 
 ---
 
@@ -132,9 +132,9 @@ For each status group (reading, completed, etc.) the app creates:
 
 ## Resume
 
-If the export is interrupted (crash, network error, you stopped it), the app saves a checkpoint after each completed status group. Click **▶ Resume** on the Export tab to continue from where it left off.
+If the export is interrupted (crash, network error, you stopped it), the app saves a checkpoint after each completed status group. Click **Resume** on the Export tab to continue from where it left off.
 
-To start fresh, go to **Settings → Clear Checkpoint**.
+To start fresh, go to **Settings → Resume checkpoint → Clear checkpoint**.
 
 ---
 
@@ -143,7 +143,7 @@ To start fresh, go to **Settings → Clear Checkpoint**.
 **"Authentication failed"**
 - Double-check your Client ID, Client Secret, username, and password
 - Make sure your API client is set to **Personal** type and is **approved** on MangaDex
-- Try the **✓ Test Credentials** button first
+- Click **Verify credentials** first: it checks your login against MangaDex and shows how long the token is valid
 
 **"Failed to set status" during import**
 - Make sure your API client exists and is approved at [mangadex.org/settings](https://mangadex.org/settings)
@@ -154,7 +154,7 @@ To start fresh, go to **Settings → Clear Checkpoint**.
 - On Linux you may need to install a GTK system package — the app will tell you the exact command for your distro
 
 **Manga missing from MAL after import**
-- Those titles are listed in the **Skipped Manga** section — they have no MAL ID on MangaDex
+- Those titles are listed in the **Skipped** panel (with a one-click MAL search for each) — they have no MAL ID on MangaDex
 - Add them manually on MAL
 
 **Slow export speed**

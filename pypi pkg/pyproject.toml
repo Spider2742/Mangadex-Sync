@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mangadex-sync"
-version = "2.1.1"
+version = "2.2.0"
 description = "Export and import your MangaDex library to/from MyAnimeList and AniList — with scores, statuses, and chapter progress"
 readme = "README.md"
 license = { text = "MIT" }

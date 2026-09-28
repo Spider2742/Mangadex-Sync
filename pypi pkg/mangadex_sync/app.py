@@ -13,7 +13,7 @@ import pandas as pd
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 PORT      = 7337
 API_BASE  = "https://api.mangadex.org"
 AUTH_URL  = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token"
@@ -244,21 +244,29 @@ class API:
         if not rating or rating <= 0: return True
         return self.post_json(f"{API_BASE}/rating/{manga_id}", {"rating": int(rating)})
 
-    def find_by_mal_id(self, mal_id):
-        """Search MangaDex for a manga by its MAL ID. Returns MangaDex UUID or None."""
-        d = self.get(f"{API_BASE}/manga", {"links[mal]": str(mal_id), "limit": 1,
-            "contentRating[]":["safe","suggestive","erotica","pornographic"]})
-        if d and d.get("data"):
-            return d["data"][0]["id"]
+    def find_by_link(self, key, value, title):
+        """Find a MangaDex UUID for an external ID (key "mal" or "al").
+        MangaDex has no reverse lookup: /manga rejects links[...] filters with
+        a 400. So search by title and accept only a result whose own
+        links[key] matches exactly; never guess on a title match alone."""
+        if not value or not title:
+            return None
+        d = self.get(f"{API_BASE}/manga", {"title": title, "limit": 10,
+            "order[relevance]": "desc",
+            "contentRating[]": ["safe","suggestive","erotica","pornographic"]})
+        for m in (d or {}).get("data", []):
+            links = m.get("attributes", {}).get("links") or {}
+            if str(links.get(key, "")).strip() == str(value).strip():
+                return m["id"]
         return None
 
-    def find_by_al_id(self, al_id):
+    def find_by_mal_id(self, mal_id, title=""):
+        """Search MangaDex for a manga by its MAL ID. Returns MangaDex UUID or None."""
+        return self.find_by_link("mal", mal_id, title)
+
+    def find_by_al_id(self, al_id, title=""):
         """Search MangaDex for a manga by its AniList ID. Returns MangaDex UUID or None."""
-        d = self.get(f"{API_BASE}/manga", {"links[al]": str(al_id), "limit": 1,
-            "contentRating[]":["safe","suggestive","erotica","pornographic"]})
-        if d and d.get("data"):
-            return d["data"][0]["id"]
-        return None
+        return self.find_by_link("al", al_id, title)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _log(msg, tag="info"):
@@ -667,7 +675,7 @@ def _run_import(params):
                 score = entry.get("score", 0)
                 # Fallback: try AniList ID if no manga_id
                 if not mdex_id and entry.get("anilist_id"):
-                    mdex_id = api.find_by_al_id(entry["anilist_id"])
+                    mdex_id = api.find_by_al_id(entry["anilist_id"], title)
                     time.sleep(0.3)
             else:
                 # XML — need to look up MangaDex UUID from MAL ID
@@ -677,13 +685,13 @@ def _run_import(params):
                 mdex_status = MAL_REVERSE.get(mal_status, "reading")
 
                 _log(f"Looking up '{title}' (MAL #{mal_id})…", "info")
-                mdex_id = api.find_by_mal_id(mal_id)
+                mdex_id = api.find_by_mal_id(mal_id, title)
                 if not mdex_id:
                     # Try AniList ID as fallback
                     al_id = entry.get("anilist_id")
                     if al_id:
                         _log(f"  MAL lookup failed, trying AniList #{al_id}…", "info")
-                        mdex_id = api.find_by_al_id(al_id)
+                        mdex_id = api.find_by_al_id(al_id, title)
                 time.sleep(0.3)  # be nice to the API
 
             if not mdex_id:
@@ -1497,7 +1505,7 @@ td.files { font-family: var(--mono); font-size: 11px; color: var(--faint); max-w
     <span class="brand-mark"><svg class="i"><use href="#i-bolt"/></svg></span>
     <div>
       <div class="brand-name">MangaDex<b>SYNC</b></div>
-      <span class="brand-ver" id="brandVer">v2.2.0</span>
+      <span class="brand-ver" id="brandVer">v2.2.1</span>
     </div>
   </div>
   <div class="nav-label">Workspace</div>

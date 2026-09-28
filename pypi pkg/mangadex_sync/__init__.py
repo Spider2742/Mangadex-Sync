@@ -3,7 +3,7 @@ MangaDex Sync
 Export and import your MangaDex library to/from MyAnimeList and AniList.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __author__ = "Spider2742"
 
 from .app import app  # noqa: F401

@@ -50,6 +50,8 @@ python mangadex_sync.py
 
 This opens a native desktop window. You can also open `http://localhost:7337` in any browser — useful for accessing it from another device on the same network.
 
+> **Contributing?** This file is generated from `pypi pkg/mangadex_sync/app.py`, which is the source of truth. Edit `app.py` and run `python scripts/sync_standalone.py` from the repo root to regenerate this file — don't edit `mangadex_sync.py` directly, your changes will be overwritten.
+
 ---
 
 ## Step-by-step Guide

@@ -85,6 +85,24 @@ class API:
                     if r.status_code == 200: self._store(r.json())
                 except Exception: pass
 
+    @staticmethod
+    def _retry_wait(r):
+        """Compute how long to back off after a 429.
+        MangaDex sends X-RateLimit-Retry-After as a unix epoch timestamp
+        (not a delta), so read that first; fall back to a plain Retry-After
+        delta, then to a flat 5s. Clamped to 1-60s so a bad/garbage header
+        can't stall or skip the wait entirely."""
+        for header, is_epoch in (("X-RateLimit-Retry-After", True), ("Retry-After", False)):
+            raw = r.headers.get(header)
+            if raw is None: continue
+            try:
+                val = float(raw)
+                wait = val - time.time() if is_epoch else val
+                return max(1, min(60, int(round(wait))))
+            except (TypeError, ValueError):
+                continue
+        return 5
+
     def get(self, url, params=None):
         self._ensure()
         for attempt in range(MAX_RETRY):
@@ -92,7 +110,7 @@ class API:
                 r = self.session.get(url, params=params, timeout=30)
                 if r.status_code == 200: return r.json()
                 if r.status_code == 429:
-                    wait = int(r.headers.get("Retry-After", 5))
+                    wait = self._retry_wait(r)
                     self._rate_delay = min(self._rate_delay * 2, 5.0)
                     time.sleep(wait)
                 elif attempt < MAX_RETRY-1: time.sleep(2)
@@ -130,6 +148,7 @@ class API:
         out, bs = {}, 100
         for i, batch in enumerate([ids[j:j+bs] for j in range(0,len(ids),bs)]):
             d = self.get(f"{API_BASE}/chapter", {"ids[]":batch,"limit":100,
+                "includeUnavailable":1,
                 "contentRating[]":["safe","suggestive","erotica","pornographic"]})
             if d:
                 for ch in d.get("data",[]): out[ch["id"]] = ch
@@ -156,7 +175,7 @@ class API:
                 r = self.session.put(url, json=body, timeout=20)
                 if r.status_code in (200, 204): return True
                 if r.status_code == 429:
-                    time.sleep(int(r.headers.get("Retry-After", 5)))
+                    time.sleep(self._retry_wait(r))
                 elif attempt < MAX_RETRY - 1: time.sleep(2)
             except Exception:
                 if attempt < MAX_RETRY - 1: time.sleep(2)
@@ -169,7 +188,7 @@ class API:
                 r = self.session.post(url, json=body, timeout=20)
                 if r.status_code in (200, 201, 204): return True
                 if r.status_code == 429:
-                    time.sleep(int(r.headers.get("Retry-After", 5)))
+                    time.sleep(self._retry_wait(r))
                 elif attempt < MAX_RETRY - 1: time.sleep(2)
             except Exception:
                 if attempt < MAX_RETRY - 1: time.sleep(2)
@@ -182,7 +201,7 @@ class API:
                 r = self.session.delete(url, timeout=20)
                 if r.status_code in (200, 204): return True
                 if r.status_code == 429:
-                    time.sleep(int(r.headers.get("Retry-After", 5)))
+                    time.sleep(self._retry_wait(r))
                 elif attempt < MAX_RETRY - 1: time.sleep(2)
             except Exception:
                 if attempt < MAX_RETRY - 1: time.sleep(2)
@@ -203,7 +222,7 @@ class API:
                 if r.status_code in (200, 201, 204):
                     return (True, "")
                 if r.status_code == 429:
-                    time.sleep(int(r.headers.get("Retry-After", 5)))
+                    time.sleep(self._retry_wait(r))
                     continue
                 try:
                     err_body = r.json()
@@ -436,6 +455,11 @@ def _run_export(params, resume_cp=None):
                     _prog(_db + _dr * (0.6 + done/total_ch*0.3) if total_ch else _db, f"Chapters {done}/{total_ch}")
 
                 ch_det = api.chapter_details(all_ch, ch_cb)
+                missing_ch = len(all_ch) - len(ch_det)
+                if missing_ch > 0:
+                    _log(f"⚠ {missing_ch} read chapter(s) couldn't be resolved "
+                         f"(likely removed from MangaDex) — progress may read lower "
+                         f"for those titles", "warning")
                 for mid, cids in ch_by_manga.items():
                     best_ch = best_vol = 0.0
                     for cid in cids:

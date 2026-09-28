@@ -32,6 +32,8 @@ mangadex-sync/
 
 Both versions are identical in functionality. Use **standalone** if you just want to run it directly. Use the **PyPI package** if you want `pip install` and a system-wide command.
 
+`standalone/mangadex_sync.py` is generated from `pypi pkg/mangadex_sync/app.py` — the PyPI package's `app.py` is the source of truth. If you're contributing a fix, edit `app.py` and then run `python scripts/sync_standalone.py` to regenerate the standalone copy (add `--check` in CI/pre-commit to catch drift).
+
 ---
 
 ## Quickstart

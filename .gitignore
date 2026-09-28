@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Runtime data written by the app next to wherever it's launched from
+mdex_history.json
+mdex_checkpoint.json

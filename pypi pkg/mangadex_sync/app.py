@@ -13,7 +13,7 @@ import pandas as pd
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 PORT      = 7337
 API_BASE  = "https://api.mangadex.org"
 AUTH_URL  = "https://auth.mangadex.org/realms/mangadex/protocol/openid-connect/token"
@@ -1089,14 +1089,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MangaDex Sync</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Cmask id=%22g%22%3E%3Crect width=%2264%22 height=%2264%22 fill=%22%23fff%22/%3E%3Ccircle cx=%2250%22 cy=%2250%22 r=%2215.5%22 fill=%22%23000%22/%3E%3C/mask%3E%3Cg mask=%22url(%23g)%22%3E%3Csvg width=%2256%22 height=%2256%22 viewBox=%220 0 48 48%22%3E%3Cg clip-path=%22url(%23a)%22%3E%3Cpath fill=%22%23272b30%22 d=%22M42.517 39.253A23.9 23.9 0 0 0 48 23.984c0-13.254-10.746-24-24-24s-24 10.746-24 24a23.9 23.9 0 0 0 5.483 15.27h37.034Z%22/%3E%3Cpath fill=%22%23ff6740%22 d=%22M5.483 39.253a24 24 0 0 0 2.022 2.163H40.5a24 24 0 0 0 2.021-2.163zm7.908 6.263H34.61a24 24 0 0 0 3.562-2.162H9.83a24 24 0 0 0 3.562 2.162Z%22/%3E%3Cpath fill=%22%23f1f1f1%22 d=%22M36.697 27.006a11 11 0 0 1-2.34-2.84l-.016-.032a10.9 10.9 0 0 1-1.332-3.978c-.008-.086-.02-.172-.027-.26v-.015a2.8 2.8 0 0 0-.603-1.34 2 2 0 0 0-.093-.1 19.28 19.28 0 0 0-9.8-5.911 12.15 12.15 0 0 1 1.499-6.436.699.699 0 0 0-.78-1.013A25.47 25.47 0 0 0 5.189 17.795a23 23 0 0 0-3.18-1.412c-.23-.082-.463-.157-.696-.233a24.05 24.05 0 0 0 2.51 20.834H31.01a2.81 2.81 0 0 0 2.666-1.94 2.8 2.8 0 0 1 .976-1.494h.005q.052-.044.108-.081c.05-.039.1-.07.151-.103a5.51 5.51 0 0 0 2.218-4.428 5.5 5.5 0 0 0-.31-1.826c-.046-.039-.087-.07-.127-.106m-6.322-2.05a.7.7 0 0 1-.324-.081 3.76 3.76 0 0 0-1.894-.506 3.9 3.9 0 0 0-1.835.47c-.005 0-.01.008-.016.01a.3.3 0 0 0-.059.035.68.68 0 0 1-.616-1.213 5.16 5.16 0 0 1 2.526-.656 5.1 5.1 0 0 1 2.267.524q.133.06.261.135l.068.041a.678.678 0 0 1-.375 1.242z%22/%3E%3Cpath fill=%22%23ff6740%22 d=%22M5.258 17.676c1.304 6.245 6.718 10.93 13.21 10.93 3.822 0 7.27-1.625 9.727-4.235h-.04a3.9 3.9 0 0 0-1.835.47c-.004 0-.01.008-.016.01a.3.3 0 0 0-.059.035.68.68 0 0 1-.616-1.213 5.16 5.16 0 0 1 3.608-.544 13.9 13.9 0 0 0 2.42-5.356 19.25 19.25 0 0 0-9.167-5.239 12.15 12.15 0 0 1 1.496-6.44.699.699 0 0 0-.781-1.013A25.47 25.47 0 0 0 5.258 17.676%22/%3E%3Cpath fill=%22%23272b30%22 d=%22M33.236 30.59a22 22 0 0 0-1.752-.518c-.59-.142-1.18-.296-1.776-.412a25.6 25.6 0 0 0-3.602-.482c-.302-.026-.605-.035-.907-.049a10 10 0 0 0-.908 0c-.303.013-.605.022-.908.035l-.452.036a8 8 0 0 0-.453.042 17.4 17.4 0 0 0-3.558.75l-.006-.018a15.2 15.2 0 0 1 3.547-.882c.302-.045.607-.065.91-.094.305-.03.61-.04.916-.043q.458-.005.916-.005c.305.001.61.018.915.04 1.219.084 2.43.26 3.621.527q.896.198 1.773.46c.585.174 1.165.367 1.732.596zm-.529 1.11a24 24 0 0 0-1.81-.252c-.605-.058-1.21-.117-1.817-.144a25.6 25.6 0 0 0-3.634.058c-.302.02-.603.056-.904.087q-.452.047-.9.13a67 67 0 0 0-.89.17l-.442.103c-.15.03-.296.07-.442.107q-.882.225-1.732.549-.856.32-1.675.727l-.008-.016a15.3 15.3 0 0 1 3.375-1.4c.292-.09.59-.154.887-.229.299-.06.596-.13.898-.178q.453-.072.905-.14c.303-.047.606-.074.91-.094a24 24 0 0 1 3.657-.018q.915.063 1.822.187c.603.086 1.205.188 1.8.333zm-.082 1.293c-.61.026-1.219.07-1.822.144-.602.074-1.207.146-1.805.251-1.197.197-2.379.48-3.536.844-.291.084-.576.188-.864.281s-.57.206-.844.323c-.273.117-.562.236-.835.357l-.409.196q-.207.095-.408.2a16 16 0 0 0-1.573.91q-.766.497-1.477 1.071l-.012-.014a15.2 15.2 0 0 1 2.991-2.099c.267-.15.544-.281.817-.415q.41-.2.838-.369.425-.17.854-.331.43-.16.868-.291a24 24 0 0 1 3.57-.807q.905-.135 1.82-.206a20 20 0 0 1 1.83-.064z%22/%3E%3Cpath fill=%22%23ff7bac%22 d=%22M36.697 27.006q-.305-.267-.591-.554a1.788 1.788 0 0 0 .925 3.32h.027c.012-.075.029-.148.037-.225a5.46 5.46 0 0 0-.276-2.437c-.04-.037-.082-.069-.122-.104%22/%3E%3Cpath fill=%22%23f1f1f1%22 d=%22M21.87 13.455v.254a19.2 19.2 0 0 0-5.85 3.729 10.27 10.27 0 0 1 8.032-11.514 14 14 0 0 0-2.182 7.531%22/%3E%3C/g%3E%3Cdefs%3E%3CclipPath id=%22a%22%3E%3Cpath fill=%22%23fff%22 d=%22M0 0h48v48H0z%22/%3E%3C/clipPath%3E%3C/defs%3E%3C/svg%3E%3C/g%3E%3Ccircle cx=%2250%22 cy=%2250%22 r=%2213%22 fill=%22%23ff6740%22/%3E%3Cg fill=%22none%22 stroke=%22%2312151c%22 stroke-width=%223%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22M44 46.4h11.4M52.2 43.2l3.2 3.2-3.2 3.2%22/%3E%3Cpath d=%22M56 53.6H44.6M47.8 50.4l-3.2 3.2 3.2 3.2%22/%3E%3C/g%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #0b0d12;  --panel: #12151c;  --card: #161a23;  --card-2: #1c212c;  --field: #0e1117;
   --border: #252a36;  --border-2: #323949;  --divider: #1f2430;
-  --text: #eef0f6;  --text-2: #bcc2d0;  --muted: #8b93a7;  --faint: #5b6272;
-  --accent: #e8823c;  --accent-2: #f2954f;  --accent-ink: #1a0f06;
-  --accent-tint: rgba(232,130,60,.10);  --accent-line: rgba(232,130,60,.38);
+  --text: #eef0f6;  --text-2: #bcc2d0;  --muted: #9aa2b4;  --faint: #7c8496;
+  --accent: #ff6740;  --accent-2: #ff8361;  --accent-ink: #1f0a04;
+  --accent-tint: rgba(255,103,64,.10);  --accent-line: rgba(255,103,64,.38);
   --ok: #3ecf8e;  --ok-tint: rgba(62,207,142,.10);  --ok-line: rgba(62,207,142,.35);
   --warn: #e0b23e;  --warn-tint: rgba(224,178,62,.10);  --warn-line: rgba(224,178,62,.35);
   --err: #ef5350;  --err-tint: rgba(239,83,80,.10);  --err-line: rgba(239,83,80,.35);
@@ -1135,11 +1136,10 @@ button { cursor: pointer; background: none; border: 0; }
 .sidebar { width: 232px; flex-shrink: 0; background: var(--panel); border-right: 1px solid var(--border);
            display: flex; flex-direction: column; }
 .brand { display: flex; align-items: center; gap: 10px; height: 56px; padding: 0 16px; border-bottom: 1px solid var(--divider); }
-.brand-mark { width: 28px; height: 28px; border-radius: var(--r-sm); display: grid; place-items: center;
-              background: linear-gradient(150deg, var(--accent-2), var(--accent)); color: var(--accent-ink);
-              font-size: 15px; box-shadow: 0 4px 14px -6px rgba(232,130,60,.8), inset 0 1px 0 rgba(255,255,255,.25); }
-.brand-name { font-family: var(--mono); font-size: 13px; font-weight: 700; letter-spacing: .01em; line-height: 1.2; }
-.brand-name b { color: var(--accent); font-size: 10px; letter-spacing: .12em; margin-left: 4px; }
+.brand-mark { width: 36px; height: 36px; flex-shrink: 0; }
+.brand-mark svg { display: block; width: 100%; height: 100%; }
+.brand-name { font-size: 14.5px; font-weight: 700; letter-spacing: -.01em; line-height: 1.2; }
+.brand-name b { color: var(--accent); font-weight: 700; }
 .brand-ver { display: block; font-family: var(--mono); font-size: 10px; color: var(--faint); }
 .nav-label { font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .12em;
              text-transform: uppercase; color: var(--faint); padding: 18px 16px 8px; }
@@ -1185,7 +1185,7 @@ nav { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
 .page { display: none; max-width: 1360px; margin: 0 auto; }
 .page.active { display: block; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
-.page-head h1 { font-family: var(--mono); font-size: 20px; font-weight: 700; letter-spacing: -.01em; line-height: 1.2; }
+.page-head h1 { font-size: 22px; font-weight: 700; letter-spacing: -.02em; line-height: 1.2; }
 .page-head p { color: var(--muted); font-size: 13px; margin-top: 4px; max-width: 70ch; }
 .head-meta { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 
@@ -1216,6 +1216,7 @@ nav { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
 .pill.info { color: var(--info); border-color: var(--info-line); background: var(--info-tint); }
 .pill .val { color: var(--text); }
 .sub-note { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+p.sub-note { font-family: var(--sans); font-size: 12px; line-height: 1.45; }
 
 /* ── Fields ── */
 .field + .field, .row-2 + .field, .field + .row-2 { margin-top: 12px; }
@@ -1257,7 +1258,7 @@ nav { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
 .btn-ghost { border-color: transparent; color: var(--muted); }
 .btn-ghost:hover:not(:disabled) { color: var(--text); }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
-               box-shadow: inset 0 1px 0 rgba(255,255,255,.22), 0 6px 18px -8px rgba(232,130,60,.7); }
+               box-shadow: inset 0 1px 0 rgba(255,255,255,.22), 0 6px 18px -8px rgba(255,103,64,.7); }
 .btn-primary:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); }
 .btn-lg { height: 42px; font-size: 12px; padding: 0 16px; }
 .btn-lg .i { font-size: 16px; }
@@ -1296,11 +1297,11 @@ nav { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
 .opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px; background: var(--field); border: 1px solid var(--border);
        border-radius: var(--r-sm); cursor: pointer; transition: border-color .15s, background-color .15s; }
 .opt:hover { border-color: var(--border-2); }
-.opt:has(input:checked) { border-color: var(--accent-line); background: rgba(232,130,60,.05); }
+.opt:has(input:checked) { border-color: var(--accent-line); background: rgba(255,103,64,.05); }
 .opt input { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; margin-top: 1px; flex-shrink: 0;
              border: 1px solid var(--border-2); border-radius: var(--r-xs); background: var(--panel); cursor: pointer;
              transition: background-color .15s, border-color .15s; }
-.opt input:checked { background: var(--accent) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3.5 8.5l3 3 6-7' fill='none' stroke='%231a0f06' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/></svg>") center/12px no-repeat;
+.opt input:checked { background: var(--accent) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M3.5 8.5l3 3 6-7' fill='none' stroke='%231f0a04' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/></svg>") center/12px no-repeat;
                      border-color: var(--accent); }
 .opt input:focus-visible { box-shadow: var(--ring); }
 .opt .ot { display: block; font-size: 13px; font-weight: 600; color: var(--text); line-height: 1.3; }
@@ -1332,7 +1333,7 @@ nav { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
 .prog-pct { font-family: var(--mono); font-size: 30px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
 .prog-pct small { font-size: 14px; color: var(--muted); margin-left: 2px; }
 .prog-pct.idle { color: var(--faint); }
-.prog-label { font-size: 12.5px; color: var(--text-2); text-align: right; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prog-label { font-size: 12.5px; color: var(--text-2); text-align: right; max-width: 70%; text-wrap: balance; }
 .track { position: relative; height: 8px; border-radius: var(--r-xs); background: var(--field); border: 1px solid var(--border); overflow: hidden; }
 .track::after { content: ""; position: absolute; inset: 0; pointer-events: none;
                 background: repeating-linear-gradient(90deg, transparent 0 calc(5% - 1px), rgba(11,13,18,.9) calc(5% - 1px) 5%); }
@@ -1502,10 +1503,10 @@ td.files { font-family: var(--mono); font-size: 11px; color: var(--faint); max-w
 
 <aside class="sidebar">
   <div class="brand">
-    <span class="brand-mark"><svg class="i"><use href="#i-bolt"/></svg></span>
+    <span class="brand-mark"><svg viewBox="0 0 64 64" aria-hidden="true"><mask id="brandGap"><rect width="64" height="64" fill="#fff"/><circle cx="50" cy="50" r="15.5" fill="#000"/></mask><g mask="url(#brandGap)"><svg width="56" height="56" viewBox="0 0 48 48"><g clip-path="url(#a)"><path fill="#272b30" d="M42.517 39.253A23.9 23.9 0 0 0 48 23.984c0-13.254-10.746-24-24-24s-24 10.746-24 24a23.9 23.9 0 0 0 5.483 15.27h37.034Z"/><path fill="#ff6740" d="M5.483 39.253a24 24 0 0 0 2.022 2.163H40.5a24 24 0 0 0 2.021-2.163zm7.908 6.263H34.61a24 24 0 0 0 3.562-2.162H9.83a24 24 0 0 0 3.562 2.162Z"/><path fill="#f1f1f1" d="M36.697 27.006a11 11 0 0 1-2.34-2.84l-.016-.032a10.9 10.9 0 0 1-1.332-3.978c-.008-.086-.02-.172-.027-.26v-.015a2.8 2.8 0 0 0-.603-1.34 2 2 0 0 0-.093-.1 19.28 19.28 0 0 0-9.8-5.911 12.15 12.15 0 0 1 1.499-6.436.699.699 0 0 0-.78-1.013A25.47 25.47 0 0 0 5.189 17.795a23 23 0 0 0-3.18-1.412c-.23-.082-.463-.157-.696-.233a24.05 24.05 0 0 0 2.51 20.834H31.01a2.81 2.81 0 0 0 2.666-1.94 2.8 2.8 0 0 1 .976-1.494h.005q.052-.044.108-.081c.05-.039.1-.07.151-.103a5.51 5.51 0 0 0 2.218-4.428 5.5 5.5 0 0 0-.31-1.826c-.046-.039-.087-.07-.127-.106m-6.322-2.05a.7.7 0 0 1-.324-.081 3.76 3.76 0 0 0-1.894-.506 3.9 3.9 0 0 0-1.835.47c-.005 0-.01.008-.016.01a.3.3 0 0 0-.059.035.68.68 0 0 1-.616-1.213 5.16 5.16 0 0 1 2.526-.656 5.1 5.1 0 0 1 2.267.524q.133.06.261.135l.068.041a.678.678 0 0 1-.375 1.242z"/><path fill="#ff6740" d="M5.258 17.676c1.304 6.245 6.718 10.93 13.21 10.93 3.822 0 7.27-1.625 9.727-4.235h-.04a3.9 3.9 0 0 0-1.835.47c-.004 0-.01.008-.016.01a.3.3 0 0 0-.059.035.68.68 0 0 1-.616-1.213 5.16 5.16 0 0 1 3.608-.544 13.9 13.9 0 0 0 2.42-5.356 19.25 19.25 0 0 0-9.167-5.239 12.15 12.15 0 0 1 1.496-6.44.699.699 0 0 0-.781-1.013A25.47 25.47 0 0 0 5.258 17.676"/><path fill="#272b30" d="M33.236 30.59a22 22 0 0 0-1.752-.518c-.59-.142-1.18-.296-1.776-.412a25.6 25.6 0 0 0-3.602-.482c-.302-.026-.605-.035-.907-.049a10 10 0 0 0-.908 0c-.303.013-.605.022-.908.035l-.452.036a8 8 0 0 0-.453.042 17.4 17.4 0 0 0-3.558.75l-.006-.018a15.2 15.2 0 0 1 3.547-.882c.302-.045.607-.065.91-.094.305-.03.61-.04.916-.043q.458-.005.916-.005c.305.001.61.018.915.04 1.219.084 2.43.26 3.621.527q.896.198 1.773.46c.585.174 1.165.367 1.732.596zm-.529 1.11a24 24 0 0 0-1.81-.252c-.605-.058-1.21-.117-1.817-.144a25.6 25.6 0 0 0-3.634.058c-.302.02-.603.056-.904.087q-.452.047-.9.13a67 67 0 0 0-.89.17l-.442.103c-.15.03-.296.07-.442.107q-.882.225-1.732.549-.856.32-1.675.727l-.008-.016a15.3 15.3 0 0 1 3.375-1.4c.292-.09.59-.154.887-.229.299-.06.596-.13.898-.178q.453-.072.905-.14c.303-.047.606-.074.91-.094a24 24 0 0 1 3.657-.018q.915.063 1.822.187c.603.086 1.205.188 1.8.333zm-.082 1.293c-.61.026-1.219.07-1.822.144-.602.074-1.207.146-1.805.251-1.197.197-2.379.48-3.536.844-.291.084-.576.188-.864.281s-.57.206-.844.323c-.273.117-.562.236-.835.357l-.409.196q-.207.095-.408.2a16 16 0 0 0-1.573.91q-.766.497-1.477 1.071l-.012-.014a15.2 15.2 0 0 1 2.991-2.099c.267-.15.544-.281.817-.415q.41-.2.838-.369.425-.17.854-.331.43-.16.868-.291a24 24 0 0 1 3.57-.807q.905-.135 1.82-.206a20 20 0 0 1 1.83-.064z"/><path fill="#ff7bac" d="M36.697 27.006q-.305-.267-.591-.554a1.788 1.788 0 0 0 .925 3.32h.027c.012-.075.029-.148.037-.225a5.46 5.46 0 0 0-.276-2.437c-.04-.037-.082-.069-.122-.104"/><path fill="#f1f1f1" d="M21.87 13.455v.254a19.2 19.2 0 0 0-5.85 3.729 10.27 10.27 0 0 1 8.032-11.514 14 14 0 0 0-2.182 7.531"/></g><defs><clipPath id="a"><path fill="#fff" d="M0 0h48v48H0z"/></clipPath></defs></svg></g><circle cx="50" cy="50" r="13" fill="#ff6740"/><g fill="none" stroke="#12151c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M44 46.4h11.4M52.2 43.2l3.2 3.2-3.2 3.2"/><path d="M56 53.6H44.6M47.8 50.4l-3.2 3.2 3.2 3.2"/></g></svg></span>
     <div>
-      <div class="brand-name">MangaDex<b>SYNC</b></div>
-      <span class="brand-ver" id="brandVer">v2.2.1</span>
+      <div class="brand-name">MangaDex <b>Sync</b></div>
+      <span class="brand-ver" id="brandVer">v2.2.2</span>
     </div>
   </div>
   <div class="nav-label">Workspace</div>
@@ -1767,7 +1768,7 @@ td.files { font-family: var(--mono); font-size: 11px; color: var(--faint); max-w
           <div class="card">
             <div class="card-hd"><div class="card-t"><span class="step">03 //</span>Generate</div><span class="pill" id="convState">Ready</span></div>
             <div class="card-bd">
-              <button class="btn btn-ok btn-lg" style="width:100%" id="btnGenerate" onclick="generateXml()"><svg class="i"><use href="#i-bolt"/></svg>Generate import files</button>
+              <button class="btn btn-primary btn-lg" style="width:100%" id="btnGenerate" onclick="generateXml()"><svg class="i"><use href="#i-bolt"/></svg>Generate import files</button>
               <div id="convResult" style="margin-top:12px" hidden></div>
             </div>
           </div>
